@@ -3,7 +3,7 @@ from typing import List
 import torch
 
 try:
-    from generative_recommenders.modeling.sequential.hstu import HSTUConfig
+    from generative_recommenders.research.modeling.sequential.hstu import HSTUConfig
 except ImportError:
     HSTUConfig = None
 

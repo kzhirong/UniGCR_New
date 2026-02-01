@@ -10,19 +10,13 @@ from src.utils import set_seed, setup_distributed, is_main_process
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Uni-GCR Training Launch")
-    
-    # DeepSpeed 分布式必备参数
-    parser.add_argument('--local_rank', type=int, default=-1,
-                        help='Local rank passed from distributed launcher')
-    parser.add_argument('--deepspeed_config', type=str, default='ds_config.json',
-                        help='Path to DeepSpeed config file')
-    
+
     # 允许命令行覆盖部分关键参数
-    parser.add_argument('--data_path', type=str, default='data/beauty/reviews_Beauty_5.json.gz')
+    parser.add_argument('--data_path', type=str, default='data/Beauty_5.json')
     parser.add_argument('--grid_mapping', type=str, default='data/beauty/semantic_ids.json',
                         help='Path to GRID generated mapping json')
-    
-    # 注册 DeepSpeed 参数
+
+    # 注册 DeepSpeed 参数 (这会自动添加 --deepspeed_config, --local_rank 等)
     parser = deepspeed.add_config_arguments(parser)
     args = parser.parse_args()
     return args

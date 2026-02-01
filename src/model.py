@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from .config import UniGCRConfig
 
 try:
-    from generative_recommenders.modeling.sequential.hstu import HSTU as OfficialHSTU
+    from generative_recommenders.research.modeling.sequential.hstu import HSTU as OfficialHSTU
 except ImportError:
     OfficialHSTU = None
 
