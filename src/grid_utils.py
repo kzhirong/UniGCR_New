@@ -1,28 +1,84 @@
 import json
 import os
+import torch
 
 class GridMapper:
-    def __init__(self, mapping_path, num_layers, codebook_size):
-        self.num_layers = num_layers
-        self.codebook_size = codebook_size
+    def __init__(self, mapping_path, num_layers=None, codebook_size=None, auto_detect=True):
+        """
+        GridMapper for handling semantic IDs with variable codebook sizes per layer
+
+        Args:
+            mapping_path: Path to semantic_ids.json (item_id -> [code1, code2, ...])
+            num_layers: Number of semantic layers (auto-detected if not specified)
+            codebook_size: Size of codebook (only used if auto_detect=False)
+            auto_detect: If True, automatically detect codebook sizes from data
+        """
         self.mapping = self._load_mapping(mapping_path)
-        
-        # 定义每一层的 ID 范围 (0 是 padding)
-        # Layer 0: [1, 256]
-        # Layer 1: [257, 512] ...
+
+        # Auto-detect structure from actual data
+        if auto_detect and self.mapping:
+            print(f"[GridMapper] Auto-detecting codebook sizes from {mapping_path}...")
+            self.num_layers, self.codebook_sizes = self._auto_detect_structure()
+            print(f"[GridMapper] Detected {self.num_layers} layers with sizes: {self.codebook_sizes}")
+        else:
+            # Fallback to manual specification (backward compatibility)
+            if num_layers is None or codebook_size is None:
+                raise ValueError("num_layers and codebook_size must be specified if auto_detect=False")
+            self.num_layers = num_layers
+            self.codebook_sizes = [codebook_size] * num_layers
+            print(f"[GridMapper] Manual mode: {self.num_layers} layers, uniform size {codebook_size}")
+
+        # Build layer ranges with variable sizes
+        # Layer 0: [1, 1+size0]
+        # Layer 1: [1+size0, 1+size0+size1] ...
+        # Token 0 is reserved for padding
         self.layer_ranges = []
         start = 1
-        for _ in range(num_layers):
-            end = start + codebook_size
+        for layer_size in self.codebook_sizes:
+            end = start + layer_size
             self.layer_ranges.append((start, end))
             start = end
         self.total_vocab_size = start
 
+        print(f"[GridMapper] Layer ranges: {self.layer_ranges}")
+        print(f"[GridMapper] Total vocab size: {self.total_vocab_size}")
+
+        # Build reverse mapping (semantic_codes -> item_id)
         self.reverse_mapping = {}
         if self.mapping:
             for item_id, codes in self.mapping.items():
                 offset_codes = tuple(self._apply_offset(codes))
                 self.reverse_mapping[offset_codes] = item_id
+
+    def _auto_detect_structure(self):
+        """
+        Auto-detect number of layers and codebook size per layer from actual data
+
+        Returns:
+            num_layers: Number of semantic layers
+            codebook_sizes: List of codebook sizes (max_value + 1) for each layer
+        """
+        if not self.mapping:
+            raise ValueError("Cannot auto-detect: mapping is empty")
+
+        # Get first item to determine number of layers
+        first_item = next(iter(self.mapping.values()))
+        num_layers = len(first_item)
+
+        # Find max value in each layer across all items
+        max_values = [0] * num_layers
+
+        for codes in self.mapping.values():
+            if len(codes) != num_layers:
+                raise ValueError(f"Inconsistent layer count: expected {num_layers}, got {len(codes)}")
+
+            for layer_idx, code in enumerate(codes):
+                max_values[layer_idx] = max(max_values[layer_idx], code)
+
+        # Codebook size = max_value + 1 (since codes start from 0)
+        codebook_sizes = [max_val + 1 for max_val in max_values]
+
+        return num_layers, codebook_sizes
 
     def _load_mapping(self, path):
         if not os.path.exists(path):

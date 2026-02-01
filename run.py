@@ -3,7 +3,7 @@ import os
 import argparse
 import deepspeed
 from src.config import UniGCRConfig
-from src.data import get_dataloaders
+from src.data_amazon import get_dataloaders
 from src.model import UniGCRModel
 from src.trainer import UniGCRTrainer
 from src.utils import set_seed, setup_distributed, is_main_process
@@ -46,19 +46,19 @@ def main():
     conf.sem_id_codebook_size = 256
     
     # B. 辅助特征: Atomic ID (仅作 Input Context)
-    conf.use_atomic_seq = True
-    conf.num_atomic_items = 50000   # [注意] 请替换为你数据集真实的 Item 数量
+    conf.use_atomic_seq = False
+    conf.num_atomic_items = 12101   # [注意] 请替换为你数据集真实的 Item 数量
     conf.max_atomic_len = 50
     
     # C. 辅助特征: User Profiles
-    conf.use_cat_profile = True
-    conf.use_num_profile = True
+    conf.use_cat_profile = False
+    conf.use_num_profile = False
     # [注意] 请根据实际数据修改维度
     conf.cat_feature_vocab_sizes = [10000, 50, 100] # 示例: UserID, Region, Device
     conf.num_feature_size = 3                       # 示例: Age, Rating, Clicks
     
     # D. 联合训练开关
-    conf.enable_ctr = True          # 开启 CTR 任务
+    conf.enable_ctr = False          # 开启 CTR 任务
     conf.ctr_use_self_attn = True   # 开启 Candidate 自注意力
     conf.ctr_use_cross_attn = True  # 开启 User-Item 交叉注意力
     

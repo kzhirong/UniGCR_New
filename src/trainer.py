@@ -91,18 +91,23 @@ class UniGCRTrainer:
             
             # 2. Forward Pass (Shared Backbone & GR Head)
             # u: User State (B, D)
-            # gr_logits: (B, Vocab) - Next Token Prediction Logits
+            # gr_logits: (B, L, Vocab) - Autoregressive logits for all positions
             u, gr_logits = self.model_engine(batch)
-            
+
             loss = 0.0
-            
+
             # --- Task A: Generative Retrieval (GR) ---
             if self.config.use_semantic_seq:
-                # Target: Flattened Semantic Sequence
-                # shape: (B * Layers)
-                target_flat = batch['sem_target'].view(-1)
-                loss_gr = self.gr_criterion(gr_logits, target_flat)
-                
+                # gr_logits: (B, L, vocab)
+                # sem_target: (B, L)
+                B, L, vocab = gr_logits.shape
+
+                # Flatten for cross entropy loss
+                logits_flat = gr_logits.view(-1, vocab)  # (B*L, vocab)
+                target_flat = batch['sem_target'].view(-1)  # (B*L,)
+
+                loss_gr = self.gr_criterion(logits_flat, target_flat)
+
                 loss += loss_gr
                 gr_loss_sum += loss_gr.item()
             
@@ -192,10 +197,15 @@ class UniGCRTrainer:
             # --- A. 计算 Validation Loss ---
             # 1. Forward
             u, gr_logits = self.model_engine(batch)
-            
+
             # 2. GR Val Loss
             if self.config.use_semantic_seq:
-                loss_gr = self.gr_criterion(gr_logits, batch['sem_target'].view(-1))
+                # gr_logits: (B, L, vocab), need to flatten
+                B, L, vocab = gr_logits.shape
+                logits_flat = gr_logits.view(-1, vocab)
+                target_flat = batch['sem_target'].view(-1)
+
+                loss_gr = self.gr_criterion(logits_flat, target_flat)
                 val_gr_loss_sum += loss_gr.item()
                 
             # 3. CTR Val Loss & Logits Collection
@@ -221,9 +231,9 @@ class UniGCRTrainer:
             )
             
             # 计算当前 batch 的平均 Hit/NDCG
-            # 注意: target_eval 是原始 Item Codes，不是 flattened
+            # 注意: target_eval 是原始 Item indices，不是 semantic codes
             batch_hit, batch_ndcg = compute_gr_metrics(
-                candidates, batch['sem_target_eval'], grid_mapper, k=topk
+                candidates, batch['sem_target_eval'], k=topk
             )
             
             all_hit_sums += batch_hit * batch['sem_target_eval'].size(0)

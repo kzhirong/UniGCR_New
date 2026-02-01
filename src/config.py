@@ -21,8 +21,10 @@ class UniGCRConfig:
     ctr_use_cross_attn: bool = True   # User-Centric Cross-Attention
     
     # --- [Semantic ID / GRID] ---
-    sem_id_layers: int = 3
-    sem_id_codebook_size: int = 256
+    # Note: num_layers and codebook_sizes are auto-detected from semantic_ids.json
+    # These values are only fallback if auto_detect=False in GridMapper
+    sem_id_layers: int = 4  # Auto-detected at runtime (default for backward compatibility)
+    sem_id_codebook_size: int = 256  # Auto-detected at runtime (default for backward compatibility)
     grid_mapping_path: str = "data/beauty/semantic_ids.json"
     
     # --- [Atomic ID] ---

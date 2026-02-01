@@ -87,14 +87,19 @@ class UniGCRModel(nn.Module):
         self.scorer = nn.Sequential(nn.Linear(scorer_dim, 64), nn.ReLU(), nn.Linear(64, 1))
 
     def forward(self, batch_dict):
-        # 普通的前向传播 (Training GR)
+        # 前向传播 (Training GR)
         x = self.input_layer(batch_dict)
         B, L, _ = x.shape
         lengths = torch.full((B,), L, dtype=torch.long, device=x.device)
-        u_seq = self.backbone(x, lengths=lengths)
-        u = u_seq[:, -1, :]
-        logits = self.gr_head(u)
-        return u, logits
+        u_seq = self.backbone(x, lengths=lengths)  # (B, L, D)
+
+        # For GR: Apply head to ALL positions (autoregressive training)
+        logits_seq = self.gr_head(u_seq)  # (B, L, vocab)
+
+        # For CTR/Evaluation: User state from last position
+        u = u_seq[:, -1, :]  # (B, D)
+
+        return u, logits_seq
 
     def _get_item_vector(self, codes):
         """
@@ -315,5 +320,56 @@ class UniGCRModel(nn.Module):
             
         final_feats = torch.cat(feats, dim=-1)
         ctr_logits = self.scorer(final_feats).squeeze(-1)
-        
+
         return ctr_logits, labels
+
+    @torch.no_grad()
+    def generate_gr_candidates(self, batch_dict, k=10, grid_mapper=None):
+        """
+        Generate top-k candidate items using beam search for evaluation
+
+        Args:
+            batch_dict: Input batch containing user history (sem_history, etc.)
+            k: Number of candidates to generate (beam width)
+            grid_mapper: GridMapper instance for converting semantic codes to item IDs
+
+        Returns:
+            candidates: (B, k) tensor of predicted item indices
+        """
+        # 1. Forward pass to get user state
+        u, _ = self.forward(batch_dict)
+
+        # 2. Use beam search to generate top-k semantic code candidates
+        # beam_results shape: (B, k, num_layers)
+        beam_results = self._beam_search_hard_negatives(
+            batch_dict,
+            u,
+            beam_width=k,
+            grid_mapper=grid_mapper
+        )
+
+        # 3. Convert semantic codes to item indices
+        B, beam_width, num_layers = beam_results.shape
+
+        # Flatten to (B*k, num_layers) for batch processing
+        codes_flat = beam_results.view(-1, num_layers)
+
+        # Convert each semantic code sequence to item ID
+        item_indices = []
+        for i in range(codes_flat.size(0)):
+            codes = codes_flat[i].cpu().tolist()
+
+            # Use grid_mapper to reverse lookup: semantic_codes -> item_id
+            if grid_mapper:
+                item_id = grid_mapper.codes_to_item(codes)
+                # If code doesn't map to any item (shouldn't happen), use 0
+                item_indices.append(item_id if item_id is not None else 0)
+            else:
+                # Fallback if no grid_mapper provided
+                item_indices.append(0)
+
+        # 4. Reshape back to (B, k)
+        candidates = torch.tensor(item_indices, dtype=torch.long, device=u.device)
+        candidates = candidates.view(B, beam_width)
+
+        return candidates

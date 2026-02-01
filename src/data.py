@@ -15,10 +15,13 @@ class UniversalDataset(Dataset):
         if config.use_semantic_seq:
             self.grid_mapper = GridMapper(
                 config.grid_mapping_path,
-                config.sem_id_layers,
-                config.sem_id_codebook_size
+                auto_detect=True  # Auto-detect num_layers and codebook sizes
             )
+            # Update config with auto-detected values
             self.config.sem_total_vocab = self.grid_mapper.total_vocab_size
+            self.config.sem_id_layers = self.grid_mapper.num_layers
+            print(f"[Dataset] Auto-detected {self.grid_mapper.num_layers} layers")
+            print(f"[Dataset] Codebook sizes: {self.grid_mapper.codebook_sizes}")
             
         self._load_data(config.data_path)
 
