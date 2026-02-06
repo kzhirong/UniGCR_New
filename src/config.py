@@ -2,19 +2,14 @@ from dataclasses import dataclass, field
 from typing import List
 import torch
 
-try:
-    from generative_recommenders.research.modeling.sequential.hstu import HSTUConfig
-except ImportError:
-    HSTUConfig = None
-
 @dataclass
 class UniGCRConfig:
     # --- [任务开关] ---
-    enable_ctr: bool = True           # 是否开启 CTR 联合训练
+    enable_ctr: bool = False          # 是否开启 CTR 联合训练 (Phase 1: GR-only)
     use_semantic_seq: bool = True     # 是否使用 GRID Semantic ID
     use_atomic_seq: bool = False      # 是否使用 Atomic ID
-    use_cat_profile: bool = True      # 是否使用类别用户画像
-    use_num_profile: bool = True      # 是否使用数值用户画像
+    use_cat_profile: bool = False     # 是否使用类别用户画像 (Phase 1: disabled)
+    use_num_profile: bool = False     # 是否使用数值用户画像 (Phase 1: disabled)
     
     # --- [CTR 模块微调] ---
     ctr_use_self_attn: bool = True    # Candidate-Aware Self-Attention
@@ -60,20 +55,8 @@ class UniGCRConfig:
     
     # --- [运行时动态填充] ---
     sem_total_vocab: int = 0
-    
-    def to_hstu_config(self):
-        if HSTUConfig is None:
-            raise ImportError("generative_recommenders not installed.")
-        return HSTUConfig(
-            embedding_dim=self.embed_dim,
-            num_heads=self.hstu_heads,
-            num_blocks=self.hstu_layers,
-            dropout_rate=self.dropout,
-            linear_dropout_rate=0.0,
-            attn_dropout_rate=0.0,
-            forward_dropout_rate=self.dropout,
-            normalization="layer_norm",
-            activation="silu",
-            max_seq_len=self.max_seq_len,
-            attn_alpha=self.attn_alpha 
-        )
+
+    @property
+    def num_semantic_tokens_per_item(self) -> int:
+        """Number of tokens per item (layers in semantic ID)."""
+        return self.sem_id_layers

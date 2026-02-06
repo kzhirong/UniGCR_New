@@ -2,11 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .config import UniGCRConfig
-
-try:
-    from generative_recommenders.research.modeling.sequential.hstu import HSTU as OfficialHSTU
-except ImportError:
-    OfficialHSTU = None
+from .hstu_builder import build_hstu_transducer
+from .utils.jagged_utils import padded_to_jagged, jagged_to_padded, compute_jagged_params
 
 class UnifiedInputLayer(nn.Module):
     def __init__(self, config):
@@ -64,42 +61,118 @@ class UniGCRModel(nn.Module):
     def __init__(self, config: UniGCRConfig):
         super().__init__()
         self.config = config
-        
-        # 1. Input & Backbone
+
+        # 1. Input Layer
         self.input_layer = UnifiedInputLayer(config)
-        if OfficialHSTU is None: raise RuntimeError("HSTU lib missing")
-        self.backbone = OfficialHSTU(config=config.to_hstu_config(), embedding_module=None)
-        
-        # 2. GR Head
+
+        # 2. HSTU Transducer Backbone
+        self.backbone = build_hstu_transducer(config)
+
+        # 3. GR Head
         self.gr_head = nn.Linear(config.embed_dim, config.sem_total_vocab)
-        
-        # 3. CTR Components
-        self.cand_proj = nn.Sequential(nn.LayerNorm(config.embed_dim), nn.Linear(config.embed_dim, config.embed_dim))
-        
-        scorer_dim = config.embed_dim * 2
-        if config.ctr_use_self_attn:
-            self.cand_self_attn = nn.MultiheadAttention(config.embed_dim, 2, batch_first=True)
-            scorer_dim += config.embed_dim
-        if config.ctr_use_cross_attn:
-            self.user_cross_attn = nn.MultiheadAttention(config.embed_dim, 2, batch_first=True)
-            scorer_dim += config.embed_dim
-            
-        self.scorer = nn.Sequential(nn.Linear(scorer_dim, 64), nn.ReLU(), nn.Linear(64, 1))
+
+        # 4. CTR Components (will be used in Phase 2)
+        if config.enable_ctr:
+            self.cand_proj = nn.Sequential(
+                nn.LayerNorm(config.embed_dim),
+                nn.Linear(config.embed_dim, config.embed_dim)
+            )
+
+            scorer_dim = config.embed_dim * 2
+            if config.ctr_use_self_attn:
+                self.cand_self_attn = nn.MultiheadAttention(config.embed_dim, 2, batch_first=True)
+                scorer_dim += config.embed_dim
+            if config.ctr_use_cross_attn:
+                self.user_cross_attn = nn.MultiheadAttention(config.embed_dim, 2, batch_first=True)
+                scorer_dim += config.embed_dim
+
+            self.scorer = nn.Sequential(nn.Linear(scorer_dim, 64), nn.ReLU(), nn.Linear(64, 1))
 
     def forward(self, batch_dict):
-        # 前向传播 (Training GR)
-        x = self.input_layer(batch_dict)
-        B, L, _ = x.shape
-        lengths = torch.full((B,), L, dtype=torch.long, device=x.device)
-        u_seq = self.backbone(x, lengths=lengths)  # (B, L, D)
+        """
+        Forward pass for GR-only training (Phase 1).
 
-        # For GR: Apply head to ALL positions (autoregressive training)
-        logits_seq = self.gr_head(u_seq)  # (B, L, vocab)
+        Args:
+            batch_dict: {
+                'sem_history': (B, N) - semantic ID sequence with padding (0)
+                'lengths': (B,) - actual sequence length per sample
+                'num_target_tokens': (B,) - how many tokens are targets for teacher forcing
+                ... other fields (for atomic, profile - not used in Phase 1)
+            }
 
-        # For CTR/Evaluation: User state from last position
-        u = u_seq[:, -1, :]  # (B, D)
+        Returns:
+            For GR training:
+                u: (B, D) - user representation from last position
+                logits_seq: (B, N, vocab_size) - next token predictions
+                candidate_embeddings: (total_targets, D) - for future CTR use
+        """
+        # 1. Get embeddings from UnifiedInputLayer
+        embeddings = self.input_layer(batch_dict)  # (B, N, D)
+        batch_size, max_len, embed_dim = embeddings.shape
 
-        return u, logits_seq
+        # 2. Extract metadata
+        lengths = batch_dict.get('lengths')
+        if lengths is None:
+            # Fallback: assume no padding
+            lengths = torch.full((batch_size,), max_len, dtype=torch.long, device=embeddings.device)
+
+        num_target_tokens = batch_dict.get('num_target_tokens')
+        if num_target_tokens is None:
+            # Default: last item's tokens are targets
+            num_target_tokens = torch.full(
+                (batch_size,),
+                self.config.num_semantic_tokens_per_item,
+                dtype=torch.long,
+                device=embeddings.device
+            )
+
+        # 3. Input validation
+        assert (lengths > 0).all(), "All sequence lengths must be positive"
+        assert (lengths <= max_len).all(), f"Lengths {lengths.max()} exceed max_len {max_len}"
+        assert (num_target_tokens > 0).all(), "num_target_tokens must be positive"
+        assert (num_target_tokens <= lengths).all(), "num_target_tokens cannot exceed sequence length"
+
+        # 4. Convert padded to jagged
+        seq_embeddings, offsets = padded_to_jagged(embeddings, lengths)
+        # seq_embeddings: (total_len, D) where total_len = sum(lengths)
+
+        # 5. Calculate HSTUTransducer parameters
+        params = compute_jagged_params(lengths, num_target_tokens)
+
+        # 6. Create timestamps in padded format (HSTUTransducer expects this)
+        # Using sequential position indices as timestamps (ignored by L2NormPostprocessor)
+        seq_timestamps = torch.arange(max_len, device=embeddings.device, dtype=torch.float32).unsqueeze(0).expand(batch_size, -1)
+
+        # 7. Forward through HSTUTransducer
+        full_embeddings, candidate_embeddings = self.backbone(
+            max_uih_len=params['max_uih_len'],
+            max_targets=params['max_targets'],
+            total_uih_len=params['total_uih_len'],
+            total_targets=params['total_targets'],
+            seq_lengths=lengths,
+            seq_embeddings=seq_embeddings,
+            seq_timestamps=seq_timestamps,
+            num_targets=num_target_tokens,
+            seq_payloads={},
+        )
+        # full_embeddings: (total_len, D) - jagged
+        # candidate_embeddings: (total_targets, D) - jagged
+
+        # 8. Convert back to padded for prediction head
+        full_embeddings_padded = jagged_to_padded(
+            full_embeddings, lengths, max_len
+        )  # (B, N, D)
+
+        # 9. Prediction head
+        logits_seq = self.gr_head(full_embeddings_padded)  # (B, N, vocab_size)
+
+        # 10. User representation from last position
+        # Extract last valid position for each sequence
+        batch_indices = torch.arange(batch_size, device=embeddings.device)
+        last_positions = lengths - 1
+        u = full_embeddings_padded[batch_indices, last_positions, :]  # (B, D)
+
+        return u, logits_seq, candidate_embeddings
 
     def _get_item_vector(self, codes):
         """
