@@ -42,13 +42,14 @@ class MinimalInputPreprocessor(InputPreprocessor if GENERATIVE_RECOMMENDERS_AVAI
     feature transformations), this class can be extended.
     """
 
-    def __init__(self, embedding_dim: int, dropout: float = 0.0):
+    def __init__(self, embedding_dim: int, dropout: float = 0.0, is_inference: bool = False):
         """
         Args:
             embedding_dim: Dimension of embeddings
             dropout: Dropout probability to apply to embeddings
+            is_inference: Whether in inference mode (passed to HammerModule)
         """
-        super().__init__()
+        super().__init__(is_inference=is_inference)
         self.embedding_dim = embedding_dim
         self.dropout = dropout
         # Scaling factor for embeddings (similar to Transformer)
@@ -109,6 +110,32 @@ class MinimalInputPreprocessor(InputPreprocessor if GENERATIVE_RECOMMENDERS_AVAI
             seq_payloads,     # Payloads dict
         )
 
+    def interleave_targets(
+        self,
+        seq_embeddings: torch.Tensor,
+        target_embeddings: torch.Tensor,
+        seq_offsets: torch.Tensor,
+        num_targets: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Interleave target embeddings into sequence embeddings.
+
+        This is an abstract method from InputPreprocessor. For our use case,
+        we don't need complex interleaving logic - targets are already part
+        of the sequence.
+
+        Args:
+            seq_embeddings: Sequence embeddings
+            target_embeddings: Target embeddings
+            seq_offsets: Sequence offsets
+            num_targets: Number of targets per sequence
+
+        Returns:
+            Interleaved embeddings (in our case, just concatenate)
+        """
+        # Simple concatenation - targets follow history
+        return torch.cat([seq_embeddings, target_embeddings], dim=0)
+
 
 def build_stu_module(config: UniGCRConfig) -> STUStack:
     """
@@ -156,12 +183,12 @@ def build_stu_module(config: UniGCRConfig) -> STUStack:
     )
 
     # Create multiple STU layers
-    layers = [
+    stu_layers = [
         STULayer(config=stu_config, is_inference=False)
         for _ in range(config.hstu_layers)
     ]
 
-    return STUStack(layers=layers)
+    return STUStack(stu_list=stu_layers, is_inference=False)
 
 
 def build_input_preprocessor(config: UniGCRConfig) -> MinimalInputPreprocessor:
@@ -176,7 +203,8 @@ def build_input_preprocessor(config: UniGCRConfig) -> MinimalInputPreprocessor:
     """
     return MinimalInputPreprocessor(
         embedding_dim=config.embed_dim,
-        dropout=config.dropout
+        dropout=config.dropout,
+        is_inference=False
     )
 
 
@@ -190,7 +218,7 @@ def build_output_postprocessor(config: UniGCRConfig) -> L2NormPostprocessor:
     - Ignores timestamp inputs (suitable for our use case without temporal data)
 
     Args:
-        config: UniGCRConfig with embed_dim
+        config: UniGCRConfig (not used, kept for API consistency)
 
     Returns:
         L2NormPostprocessor instance
@@ -198,10 +226,7 @@ def build_output_postprocessor(config: UniGCRConfig) -> L2NormPostprocessor:
     if not GENERATIVE_RECOMMENDERS_AVAILABLE:
         raise ImportError("generative_recommenders not installed")
 
-    return L2NormPostprocessor(
-        embedding_dim=config.embed_dim,
-        eps=1e-6
-    )
+    return L2NormPostprocessor(is_inference=False)
 
 
 def build_hstu_transducer(config: UniGCRConfig) -> HSTUTransducer:

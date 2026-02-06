@@ -63,18 +63,29 @@ def test_forward_pass(model, config):
     print("TEST 2: Forward Pass")
     print("=" * 60)
 
+    # Check device availability
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
+    if device.type == 'cpu':
+        print("⚠️  Warning: Running on CPU. HSTU Triton kernels require GPU.")
+        print("⚠️  This test will likely fail. Please use a GPU runtime.")
+
+    # Move model to device
+    model = model.to(device)
+
     batch_size = 4
     seq_len = 15  # 5 items × 3 tokens/item
 
-    # Create mock batch
+    # Create mock batch on the correct device
     batch_dict = {
-        'sem_history': torch.randint(1, 1000, (batch_size, seq_len)),  # (B, N)
-        'lengths': torch.tensor([15, 12, 9, 15]),  # Variable lengths
-        'num_target_tokens': torch.tensor([3, 3, 3, 3]),  # Last item (3 tokens) is target
+        'sem_history': torch.randint(1, 1000, (batch_size, seq_len), device=device),  # (B, N)
+        'lengths': torch.tensor([15, 12, 9, 15], device=device),  # Variable lengths
+        'num_target_tokens': torch.tensor([3, 3, 3, 3], device=device),  # Last item (3 tokens) is target
     }
 
     print(f"Input shapes:")
-    print(f"  - sem_history: {batch_dict['sem_history'].shape}")
+    print(f"  - sem_history: {batch_dict['sem_history'].shape} on {batch_dict['sem_history'].device}")
     print(f"  - lengths: {batch_dict['lengths']}")
     print(f"  - num_target_tokens: {batch_dict['num_target_tokens']}")
 
