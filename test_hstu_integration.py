@@ -78,10 +78,20 @@ def test_forward_pass(model, config):
     num_items = 5  # 5 items in history
     num_tokens = num_items * config.sem_id_layers  # 5 items × 4 tokens = 20
 
-    # Create mock batch on the correct device
-    # Note: For dedup layer, use smaller vocab (0-18), but for simplicity we'll use same range
+    # Create mock batch with proper vocab sizes for each layer
+    # Structure: [item0_L0, item0_L1, item0_L2, item0_Dedup, item1_L0, item1_L1, item1_L2, item1_Dedup, ...]
+    sem_history = torch.zeros(batch_size, num_tokens, dtype=torch.long, device=device)
+
+    for i in range(num_items):
+        # L0, L1, L2: vocab size 256
+        sem_history[:, i*4 + 0] = torch.randint(1, config.sem_id_codebook_size, (batch_size,), device=device)
+        sem_history[:, i*4 + 1] = torch.randint(1, config.sem_id_codebook_size, (batch_size,), device=device)
+        sem_history[:, i*4 + 2] = torch.randint(1, config.sem_id_codebook_size, (batch_size,), device=device)
+        # Dedup: vocab size 19 (values 0-18)
+        sem_history[:, i*4 + 3] = torch.randint(0, config.sem_id_dedup_size, (batch_size,), device=device)
+
     batch_dict = {
-        'sem_history': torch.randint(1, config.sem_id_codebook_size, (batch_size, num_tokens), device=device),  # (B, N_tokens)
+        'sem_history': sem_history,  # (B, N_tokens)
         'lengths': torch.tensor([20, 16, 12, 20], device=device),  # Variable lengths in tokens (must be divisible by 4)
     }
 

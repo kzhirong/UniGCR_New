@@ -41,19 +41,34 @@ def test_loss_calculation():
     print(f"   ✓ Codebook size (L0-L2): {config.sem_id_codebook_size}")
     print(f"   ✓ Dedup size: {config.sem_id_dedup_size}")
 
-    # Create mock batch
+    # Create mock batch with proper vocab sizes for each layer
     batch_size = 4
     num_items = 5
     num_tokens = num_items * config.sem_id_layers  # 20 tokens
 
+    # Generate tokens with correct vocab sizes
+    # Structure: [item0_L0, item0_L1, item0_L2, item0_Dedup, item1_L0, ...]
+    sem_history = torch.zeros(batch_size, num_tokens, dtype=torch.long)
+    for i in range(num_items):
+        # L0, L1, L2: vocab 256
+        sem_history[:, i*4 + 0] = torch.randint(1, 256, (batch_size,))
+        sem_history[:, i*4 + 1] = torch.randint(1, 256, (batch_size,))
+        sem_history[:, i*4 + 2] = torch.randint(1, 256, (batch_size,))
+        # Dedup: vocab 19
+        sem_history[:, i*4 + 3] = torch.randint(0, 19, (batch_size,))
+
     batch = {
-        'sem_history': torch.randint(1, 256, (batch_size, num_tokens)),
+        'sem_history': sem_history,
         'lengths': torch.tensor([20, 16, 12, 20])
     }
 
-    # Create targets (same shape as sem_history: flattened tokens)
-    # Targets should match the input format
-    sem_target_flat = torch.randint(1, 256, (batch_size, num_tokens))
+    # Create targets with same structure
+    sem_target_flat = torch.zeros(batch_size, num_tokens, dtype=torch.long)
+    for i in range(num_items):
+        sem_target_flat[:, i*4 + 0] = torch.randint(1, 256, (batch_size,))
+        sem_target_flat[:, i*4 + 1] = torch.randint(1, 256, (batch_size,))
+        sem_target_flat[:, i*4 + 2] = torch.randint(1, 256, (batch_size,))
+        sem_target_flat[:, i*4 + 3] = torch.randint(0, 19, (batch_size,))
 
     print(f"\n2. Input Shapes:")
     print(f"   ✓ sem_history: {batch['sem_history'].shape}")

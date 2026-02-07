@@ -47,13 +47,13 @@ class PassthroughEmbeddingModule(nn.Module):
     """
     Passthrough embedding module for Research HSTU.
 
-    UniGCR's InputLayer already handles semantic token embedding (3 tokens per item).
+    UniGCR's InputLayer already handles semantic token embedding (4 tokens per item).
     This module satisfies HSTU's API requirement but doesn't do actual embedding lookup.
 
     Architecture rationale:
-    - UniGCR uses RQ-VAE semantic IDs: 3 tokens per item
+    - UniGCR uses RQ-VAE semantic IDs: 4 tokens per item [L0, L1, L2, Dedup]
     - HSTU expects: 1 ID per item
-    - Solution: InputLayer converts 3-token → 1-embedding, HSTU uses pre-computed embeddings
+    - Solution: InputLayer converts 4-token → 1-embedding, HSTU uses pre-computed embeddings
     """
 
     def __init__(self, embedding_dim: int):
@@ -62,7 +62,12 @@ class PassthroughEmbeddingModule(nn.Module):
             embedding_dim: Dimension of item embeddings (must match InputLayer output)
         """
         super().__init__()
-        self.embedding_dim = embedding_dim
+        self._embedding_dim = embedding_dim
+
+    @property
+    def item_embedding_dim(self) -> int:
+        """Property required by Research HSTU."""
+        return self._embedding_dim
 
     def get_item_embeddings(self, item_ids: torch.Tensor) -> torch.Tensor:
         """
@@ -79,14 +84,14 @@ class PassthroughEmbeddingModule(nn.Module):
         """
         batch_size, seq_len = item_ids.shape
         return torch.zeros(
-            batch_size, seq_len, self.embedding_dim,
+            batch_size, seq_len, self._embedding_dim,
             dtype=torch.float32,
             device=item_ids.device
         )
 
     def get_item_embedding_dim(self) -> int:
-        """Return embedding dimension."""
-        return self.embedding_dim
+        """Return embedding dimension (backward compatibility)."""
+        return self._embedding_dim
 
 
 def build_embedding_module(config: UniGCRConfig) -> PassthroughEmbeddingModule:

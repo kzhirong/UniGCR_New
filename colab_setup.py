@@ -178,8 +178,28 @@ except ImportError:
     else:
         print(f"⚠️  File not found: {hstu_attention_file} (not critical for Research HSTU)")
 
-    # Step 7: Verify installation
-    print("\n✅ Step 7: Verify Installation")
+    # Step 7: Patch fbgemm compatibility issues
+    print("\n🔧 Step 7: Patch fbgemm compatibility")
+
+    # Patch missing asynchronous_complete_cumsum
+    import torch
+    if not hasattr(torch.ops.fbgemm, 'asynchronous_complete_cumsum'):
+        print("⚠️  fbgemm.asynchronous_complete_cumsum not found, adding fallback...")
+
+        def async_cumsum_fallback(lengths):
+            """Fallback implementation using torch.cumsum"""
+            return torch.cat([
+                torch.zeros(1, dtype=lengths.dtype, device=lengths.device),
+                torch.cumsum(lengths, dim=0)
+            ])
+
+        torch.ops.fbgemm.asynchronous_complete_cumsum = async_cumsum_fallback
+        print("✅ Registered fallback for asynchronous_complete_cumsum")
+    else:
+        print("✅ fbgemm.asynchronous_complete_cumsum already available")
+
+    # Step 8: Verify installation
+    print("\n✅ Step 8: Verify Installation")
 
     # Add the package to sys.path explicitly
     if gen_rec_path not in sys.path:
