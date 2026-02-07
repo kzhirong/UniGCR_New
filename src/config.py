@@ -18,8 +18,12 @@ class UniGCRConfig:
     # --- [Semantic ID / GRID] ---
     # Note: num_layers and codebook_sizes are auto-detected from semantic_ids.json
     # These values are only fallback if auto_detect=False in GridMapper
-    sem_id_layers: int = 4  # Auto-detected at runtime (default for backward compatibility)
-    sem_id_codebook_size: int = 256  # Auto-detected at runtime (default for backward compatibility)
+    # 4 layers: [L0, L1, L2, Dedup]
+    # - L0, L1, L2: RQ-VAE layers (256 codebook each)
+    # - Dedup: Handles ID collisions when multiple items map to same [L0,L1,L2] (19 values: 0-18)
+    sem_id_layers: int = 4  # 4 layers including deduplication
+    sem_id_codebook_size: int = 256  # Codebook size for L0, L1, L2
+    sem_id_dedup_size: int = 19  # Deduplication column vocabulary (0-18)
     grid_mapping_path: str = "data/beauty/semantic_ids.json"
     
     # --- [Atomic ID] ---
@@ -37,6 +41,15 @@ class UniGCRConfig:
     hstu_heads: int = 2
     dropout: float = 0.1
     attn_alpha: float = 1.0
+
+    # --- [Research HSTU Advanced Parameters (Optional)] ---
+    # These follow Meta's ICML'24 paper recommendations
+    # Base model: num_blocks=2, num_heads=1, dqk=dv=embed_dim
+    # Large model: num_blocks=8, num_heads=2, dqk=dv=embed_dim//2
+    hstu_normalization: str = "rel_bias"       # Normalization strategy
+    hstu_linear_config: str = "uvqk"            # Linear layer configuration
+    hstu_linear_activation: str = "silu"        # SiLU (Swish) activation
+    hstu_enable_rel_bias: bool = True          # Enable relative attention bias
     
     # --- [训练参数] ---
     patience: int = 3

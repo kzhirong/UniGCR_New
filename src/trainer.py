@@ -91,22 +91,45 @@ class UniGCRTrainer:
             
             # 2. Forward Pass (Shared Backbone & GR Head)
             # u: User State (B, D)
-            # gr_logits: (B, L, Vocab) - Autoregressive logits for all positions
-            u, gr_logits = self.model_engine(batch)
+            # gr_logits: List of 4 tensors (L0, L1, L2, Dedup) with different vocab sizes
+            u, gr_logits, _ = self.model_engine(batch)
 
             loss = 0.0
 
             # --- Task A: Generative Retrieval (GR) ---
             if self.config.use_semantic_seq:
-                # gr_logits: (B, L, vocab)
-                # sem_target: (B, L)
-                B, L, vocab = gr_logits.shape
+                # gr_logits: List of 4 tensors
+                # - logits_L0: (B, num_items, 256)
+                # - logits_L1: (B, num_items, 256)
+                # - logits_L2: (B, num_items, 256)
+                # - logits_Dedup: (B, num_items, 19)
+                # sem_target: (B, num_items, 4) - targets for all 4 layers
 
-                # Flatten for cross entropy loss
-                logits_flat = gr_logits.view(-1, vocab)  # (B*L, vocab)
-                target_flat = batch['sem_target'].view(-1)  # (B*L,)
+                # Reshape targets to (B, num_items, 4) if flattened
+                sem_target = batch['sem_target']
+                B = sem_target.size(0)
 
-                loss_gr = self.gr_criterion(logits_flat, target_flat)
+                # If targets are flattened (B, num_items*4), reshape to (B, num_items, 4)
+                if sem_target.dim() == 2 and sem_target.size(1) % self.config.sem_id_layers == 0:
+                    num_items = sem_target.size(1) // self.config.sem_id_layers
+                    sem_target = sem_target.view(B, num_items, self.config.sem_id_layers)
+
+                # Compute loss for each layer separately
+                loss_gr = 0.0
+                for layer_idx, logits_layer in enumerate(gr_logits):
+                    # logits_layer: (B, num_items, vocab_size_for_layer)
+                    # targets_layer: (B, num_items)
+                    targets_layer = sem_target[:, :, layer_idx]
+
+                    # Flatten for cross entropy
+                    logits_flat = logits_layer.reshape(-1, logits_layer.size(-1))
+                    targets_flat = targets_layer.reshape(-1)
+
+                    # Compute loss for this layer
+                    loss_gr += self.gr_criterion(logits_flat, targets_flat)
+
+                # Average over 4 layers
+                loss_gr = loss_gr / self.config.sem_id_layers
 
                 loss += loss_gr
                 gr_loss_sum += loss_gr.item()
@@ -196,16 +219,31 @@ class UniGCRTrainer:
             
             # --- A. 计算 Validation Loss ---
             # 1. Forward
-            u, gr_logits = self.model_engine(batch)
+            u, gr_logits, _ = self.model_engine(batch)
 
             # 2. GR Val Loss
             if self.config.use_semantic_seq:
-                # gr_logits: (B, L, vocab), need to flatten
-                B, L, vocab = gr_logits.shape
-                logits_flat = gr_logits.view(-1, vocab)
-                target_flat = batch['sem_target'].view(-1)
+                # gr_logits: List of 4 tensors with different vocab sizes
+                # sem_target: (B, num_items, 4) or (B, num_items*4) flattened
 
-                loss_gr = self.gr_criterion(logits_flat, target_flat)
+                # Reshape targets to (B, num_items, 4) if flattened
+                sem_target = batch['sem_target']
+                B = sem_target.size(0)
+
+                if sem_target.dim() == 2 and sem_target.size(1) % self.config.sem_id_layers == 0:
+                    num_items = sem_target.size(1) // self.config.sem_id_layers
+                    sem_target = sem_target.view(B, num_items, self.config.sem_id_layers)
+
+                # Compute loss for each layer separately
+                loss_gr = 0.0
+                for layer_idx, logits_layer in enumerate(gr_logits):
+                    targets_layer = sem_target[:, :, layer_idx]
+                    logits_flat = logits_layer.reshape(-1, logits_layer.size(-1))
+                    targets_flat = targets_layer.reshape(-1)
+                    loss_gr += self.gr_criterion(logits_flat, targets_flat)
+
+                # Average over 4 layers
+                loss_gr = loss_gr / self.config.sem_id_layers
                 val_gr_loss_sum += loss_gr.item()
                 
             # 3. CTR Val Loss & Logits Collection

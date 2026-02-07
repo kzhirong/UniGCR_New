@@ -2,7 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .config import UniGCRConfig
-from .hstu_builder import build_research_hstu
+from .hstu_builder import build_hstu_transducer
+from .utils.jagged_utils import padded_to_jagged, jagged_to_padded, compute_jagged_params
 
 class UnifiedInputLayer(nn.Module):
     def __init__(self, config):
@@ -10,19 +11,9 @@ class UnifiedInputLayer(nn.Module):
         self.config = config
         dim = config.embed_dim
         
-        # 1. Semantic Embedding (RQ-VAE + Deduplication: 4 layers)
+        # 1. Semantic Embedding
         if config.use_semantic_seq:
-            # Create separate embedding tables for each semantic layer
-            # Layers: [L0, L1, L2, Dedup]
-            # - L0, L1, L2: RQ-VAE layers (vocab size 256)
-            # - Dedup: Handles collisions (vocab size 19: values 0-18)
-            self.sem_emb_layers = nn.ModuleList([
-                nn.Embedding(config.sem_id_codebook_size, dim, padding_idx=0),  # L0: 256 vocab
-                nn.Embedding(config.sem_id_codebook_size, dim, padding_idx=0),  # L1: 256 vocab
-                nn.Embedding(config.sem_id_codebook_size, dim, padding_idx=0),  # L2: 256 vocab
-                nn.Embedding(config.sem_id_dedup_size, dim, padding_idx=0),     # Dedup: 19 vocab
-            ])
-            self.num_semantic_layers = config.sem_id_layers  # 4
+            self.sem_emb = nn.Embedding(config.sem_total_vocab, dim, padding_idx=0)
             
         # 2. Atomic Embedding
         if config.use_atomic_seq:
@@ -58,28 +49,10 @@ class UnifiedInputLayer(nn.Module):
         if self.config.use_atomic_seq and 'atom_history' in input_dict:
             tokens.append(self.atom_emb(input_dict['atom_history']))
             
-        # C. Semantic Sequence (RQ-VAE + Deduplication: 4 tokens per item)
-        # sem_history is flattened: [tok0_L0, tok0_L1, tok0_L2, tok0_Dedup, tok1_L0, tok1_L1, tok1_L2, tok1_Dedup, ...]
-        # We need to reshape to (B, num_items, num_layers) and embed each layer separately
+        # C. Semantic Sequence
+        # 在 Beam Search 时，sem_history 会不断变长
         if self.config.use_semantic_seq and 'sem_history' in input_dict:
-            sem_history = input_dict['sem_history']  # (B, N) - flattened tokens
-            batch_size, total_tokens = sem_history.shape
-
-            # Reshape: (B, N) → (B, num_items, num_layers)
-            # e.g., (4, 16) → (4, 4, 4) for 4 items with 4 tokens each [L0, L1, L2, Dedup]
-            num_items = total_tokens // self.num_semantic_layers
-            sem_tokens = sem_history.view(batch_size, num_items, self.num_semantic_layers)
-
-            # Embed each layer separately and sum them
-            layer_embeddings = []
-            for layer_idx in range(self.num_semantic_layers):
-                layer_tokens = sem_tokens[:, :, layer_idx]  # (B, num_items)
-                layer_emb = self.sem_emb_layers[layer_idx](layer_tokens)  # (B, num_items, D)
-                layer_embeddings.append(layer_emb)
-
-            # Combine layer embeddings (sum across layers)
-            item_embeddings = torch.stack(layer_embeddings, dim=0).sum(dim=0)  # (B, num_items, D)
-            tokens.append(item_embeddings)
+            tokens.append(self.sem_emb(input_dict['sem_history']))
             
         if not tokens: raise ValueError("Empty inputs")
         return torch.cat(tokens, dim=1)
@@ -89,18 +62,14 @@ class UniGCRModel(nn.Module):
         super().__init__()
         self.config = config
 
-        # 1. Input Layer (handles 4-token-per-item semantic IDs: L0, L1, L2, Dedup)
+        # 1. Input Layer
         self.input_layer = UnifiedInputLayer(config)
 
-        # 2. Research HSTU Backbone (receives pre-computed item embeddings)
-        self.backbone = build_research_hstu(config)
+        # 2. HSTU Transducer Backbone
+        self.backbone = build_hstu_transducer(config)
 
-        # 3. GR Heads - predict all 4 semantic tokens for complete item prediction
-        # Four heads: L0, L1, L2 (RQ-VAE layers), Dedup (collision resolution)
-        self.gr_head_L0 = nn.Linear(config.embed_dim, config.sem_id_codebook_size)      # vocab=256
-        self.gr_head_L1 = nn.Linear(config.embed_dim, config.sem_id_codebook_size)      # vocab=256
-        self.gr_head_L2 = nn.Linear(config.embed_dim, config.sem_id_codebook_size)      # vocab=256
-        self.gr_head_Dedup = nn.Linear(config.embed_dim, config.sem_id_dedup_size)      # vocab=19
+        # 3. GR Head
+        self.gr_head = nn.Linear(config.embed_dim, config.sem_total_vocab)
 
         # 4. CTR Components (will be used in Phase 2)
         if config.enable_ctr:
@@ -125,73 +94,88 @@ class UniGCRModel(nn.Module):
 
         Args:
             batch_dict: {
-                'sem_history': (B, N_tokens) - flattened semantic tokens (num_items * 4)
-                'lengths': (B,) - actual sequence length in TOKENS (optional)
+                'sem_history': (B, N) - semantic ID sequence with padding (0)
+                'lengths': (B,) - actual sequence length per sample
+                'num_target_tokens': (B,) - how many tokens are targets for teacher forcing
                 ... other fields (for atomic, profile - not used in Phase 1)
             }
 
         Returns:
             For GR training:
-                u: (B, D) - user representation from last item position
-                logits_seq: List of 4 tensors (different vocab sizes):
-                    - logits_L0: (B, num_items, 256) - RQ-VAE layer 0
-                    - logits_L1: (B, num_items, 256) - RQ-VAE layer 1
-                    - logits_L2: (B, num_items, 256) - RQ-VAE layer 2
-                    - logits_Dedup: (B, num_items, 19) - Deduplication layer
-                candidate_embeddings: None - not used in Research HSTU
+                u: (B, D) - user representation from last position
+                logits_seq: (B, N, vocab_size) - next token predictions
+                candidate_embeddings: (total_targets, D) - for future CTR use
         """
-        # 1. Get item-level embeddings from UnifiedInputLayer
-        # InputLayer converts: (B, N_tokens) → (B, num_items, D)
-        # by reshaping to (B, num_items, 4) and embedding each layer separately
-        embeddings = self.input_layer(batch_dict)  # (B, num_items, D)
-        batch_size, num_items, embed_dim = embeddings.shape
+        # 1. Get embeddings from UnifiedInputLayer
+        embeddings = self.input_layer(batch_dict)  # (B, N, D)
+        batch_size, max_len, embed_dim = embeddings.shape
 
-        # 2. Extract sequence lengths (convert from token-level to item-level)
-        lengths_tokens = batch_dict.get('lengths')
-        if lengths_tokens is not None:
-            # Convert token-level lengths to item-level lengths
-            # e.g., 20 tokens = 5 items (20 // 4)
-            lengths = lengths_tokens // self.config.sem_id_layers
-        else:
+        # 2. Extract metadata
+        lengths = batch_dict.get('lengths')
+        if lengths is None:
             # Fallback: assume no padding
-            lengths = torch.full((batch_size,), num_items, dtype=torch.long, device=embeddings.device)
+            lengths = torch.full((batch_size,), max_len, dtype=torch.long, device=embeddings.device)
+
+        num_target_tokens = batch_dict.get('num_target_tokens')
+        if num_target_tokens is None:
+            # Default: last item's tokens are targets
+            num_target_tokens = torch.full(
+                (batch_size,),
+                self.config.num_semantic_tokens_per_item,
+                dtype=torch.long,
+                device=embeddings.device
+            )
 
         # 3. Input validation
         assert (lengths > 0).all(), "All sequence lengths must be positive"
-        assert (lengths <= num_items).all(), f"Lengths {lengths.max()} exceed num_items {num_items}"
+        assert (lengths <= max_len).all(), f"Lengths {lengths.max()} exceed max_len {max_len}"
+        assert (num_target_tokens > 0).all(), "num_target_tokens must be positive"
+        assert (num_target_tokens <= lengths).all(), "num_target_tokens cannot exceed sequence length"
 
-        # 4. Prepare inputs for Research HSTU
-        # Create dummy item IDs (HSTU API requirement, but uses past_embeddings instead)
-        past_ids = torch.arange(num_items, device=embeddings.device).unsqueeze(0).expand(batch_size, -1)
-        past_embeddings = embeddings  # Pre-computed item embeddings from InputLayer
-        past_payloads = {}  # Can add timestamps here if needed
+        # 4. Convert padded to jagged
+        seq_embeddings, offsets = padded_to_jagged(embeddings, lengths)
+        # seq_embeddings: (total_len, D) where total_len = sum(lengths)
 
-        # 5. Forward through Research HSTU
-        # Returns: (B, num_items, D) - contextualized item embeddings for ALL positions
-        full_embeddings = self.backbone(
-            past_lengths=lengths,
-            past_ids=past_ids,           # Dummy IDs (API requirement)
-            past_embeddings=past_embeddings,  # Actual item embeddings (pre-computed)
-            past_payloads=past_payloads,
-        )  # (B, num_items, D)
+        # 5. Calculate HSTUTransducer parameters
+        params = compute_jagged_params(lengths, num_target_tokens)
 
-        # 6. Prediction heads - predict all 4 semantic tokens for complete items
-        # Each position predicts the next item's [L0, L1, L2, Dedup] tokens
-        logits_L0 = self.gr_head_L0(full_embeddings)      # (B, num_items, 256)
-        logits_L1 = self.gr_head_L1(full_embeddings)      # (B, num_items, 256)
-        logits_L2 = self.gr_head_L2(full_embeddings)      # (B, num_items, 256)
-        logits_Dedup = self.gr_head_Dedup(full_embeddings)  # (B, num_items, 19)
+        # 6. Create timestamps in padded format (HSTUTransducer expects this)
+        # Using sequential position indices as timestamps (ignored by L2NormPostprocessor)
+        seq_timestamps = torch.arange(max_len, device=embeddings.device, dtype=torch.float32).unsqueeze(0).expand(batch_size, -1)
 
-        # Return as list since vocab sizes differ (256, 256, 256, 19)
-        # List of 4 tensors: [L0_logits, L1_logits, L2_logits, Dedup_logits]
-        logits_seq = [logits_L0, logits_L1, logits_L2, logits_Dedup]
+        # 7. Forward through HSTUTransducer
+        full_embeddings, candidate_embeddings = self.backbone(
+            max_uih_len=params['max_uih_len'],
+            max_targets=params['max_targets'],
+            total_uih_len=params['total_uih_len'],
+            total_targets=params['total_targets'],
+            seq_lengths=lengths,
+            seq_embeddings=seq_embeddings,
+            seq_timestamps=seq_timestamps,
+            num_targets=num_target_tokens,
+            seq_payloads={},
+        )
+        # full_embeddings: (total_len, D) - jagged
+        # candidate_embeddings: (total_targets, D) - jagged
 
-        # 7. User representation from last valid item position
+        # 8. Convert back to padded for prediction head
+        # Note: full_embeddings contains only UIH (history) embeddings, not targets
+        uih_lengths = lengths - num_target_tokens
+        max_uih_len = uih_lengths.max().item()
+        full_embeddings_padded = jagged_to_padded(
+            full_embeddings, uih_lengths, max_uih_len
+        )  # (B, max_uih_len, D)
+
+        # 9. Prediction head
+        logits_seq = self.gr_head(full_embeddings_padded)  # (B, max_uih_len, vocab_size)
+
+        # 10. User representation from last UIH position
+        # Extract last valid position for each UIH sequence
         batch_indices = torch.arange(batch_size, device=embeddings.device)
-        last_positions = lengths - 1
-        u = full_embeddings[batch_indices, last_positions, :]  # (B, D)
+        last_positions = uih_lengths - 1
+        u = full_embeddings_padded[batch_indices, last_positions, :]  # (B, D)
 
-        return u, logits_seq, None  # candidate_embeddings not used in Research HSTU
+        return u, logits_seq, candidate_embeddings
 
     def _get_item_vector(self, codes):
         """

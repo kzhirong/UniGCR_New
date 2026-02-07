@@ -1,280 +1,261 @@
 """
-Builder functions for creating HSTUTransducer and its components.
+Builder functions for creating Research HSTU and its components.
 
-This module creates all the necessary components for using HSTUTransducer
+This module creates all the necessary components for using Research HSTU
 from generative_recommenders for autoregressive generative retrieval.
+
+Note: We use Option B architecture where UniGCR's InputLayer handles
+the 3-token-per-item semantic ID structure, and HSTU receives pre-computed
+item-level embeddings.
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from typing import Dict, Tuple, Optional
+from typing import Dict, Optional
 
 from .config import UniGCRConfig
 
-# Import from generative_recommenders
+# Import from generative_recommenders - Research HSTU
 try:
-    from generative_recommenders.modules.stu import STULayer, STUStack, STULayerConfig
-    from generative_recommenders.modules.hstu_transducer import HSTUTransducer
-    from generative_recommenders.modules.preprocessors import InputPreprocessor
-    from generative_recommenders.modules.postprocessors import L2NormPostprocessor
+    from generative_recommenders.research.modeling.sequential.hstu import HSTU
+    from generative_recommenders.research.modeling.sequential.embedding_modules import (
+        EmbeddingModule,
+    )
+    from generative_recommenders.research.modeling.sequential.input_features_preprocessors import (
+        InputFeaturesPreprocessorModule,
+        LearnablePositionalEmbeddingInputFeaturesPreprocessor,
+    )
+    from generative_recommenders.research.modeling.sequential.output_postprocessors import (
+        OutputPostprocessorModule,
+        L2NormEmbeddingPostprocessor,
+    )
+    from generative_recommenders.research.rails.similarities.module import SimilarityModule
+    from generative_recommenders.research.rails.similarities.dot_product_similarity_fn import (
+        DotProductSimilarity,
+    )
     GENERATIVE_RECOMMENDERS_AVAILABLE = True
 except ImportError:
     GENERATIVE_RECOMMENDERS_AVAILABLE = False
-    STULayer = None
-    STUStack = None
-    STULayerConfig = None
-    HSTUTransducer = None
-    InputPreprocessor = None
-    L2NormPostprocessor = None
+    HSTU = None
+    EmbeddingModule = object
+    InputFeaturesPreprocessorModule = object
+    OutputPostprocessorModule = object
+    SimilarityModule = object
 
 
-class MinimalInputPreprocessor(InputPreprocessor if GENERATIVE_RECOMMENDERS_AVAILABLE else nn.Module):
+class PassthroughEmbeddingModule(nn.Module):
     """
-    Minimal input preprocessor for HSTUTransducer.
+    Passthrough embedding module for Research HSTU.
 
-    This preprocessor:
-    - Scales embeddings by sqrt(embedding_dim) for better gradient flow
-    - Applies dropout during training
-    - Passes through all other inputs unchanged
+    UniGCR's InputLayer already handles semantic token embedding (3 tokens per item).
+    This module satisfies HSTU's API requirement but doesn't do actual embedding lookup.
 
-    For more advanced preprocessing (e.g., adding positional encodings,
-    feature transformations), this class can be extended.
+    Architecture rationale:
+    - UniGCR uses RQ-VAE semantic IDs: 3 tokens per item
+    - HSTU expects: 1 ID per item
+    - Solution: InputLayer converts 3-token → 1-embedding, HSTU uses pre-computed embeddings
     """
 
-    def __init__(self, embedding_dim: int, dropout: float = 0.0, is_inference: bool = False):
+    def __init__(self, embedding_dim: int):
         """
         Args:
-            embedding_dim: Dimension of embeddings
-            dropout: Dropout probability to apply to embeddings
-            is_inference: Whether in inference mode (passed to HammerModule)
+            embedding_dim: Dimension of item embeddings (must match InputLayer output)
         """
-        super().__init__(is_inference=is_inference)
+        super().__init__()
         self.embedding_dim = embedding_dim
-        self.dropout = dropout
-        # Scaling factor for embeddings (similar to Transformer)
-        self.scale = embedding_dim ** 0.5
 
-    def forward(
-        self,
-        max_uih_len: int,
-        max_targets: int,
-        total_uih_len: int,
-        total_targets: int,
-        seq_lengths: torch.Tensor,
-        seq_timestamps: torch.Tensor,
-        seq_embeddings: torch.Tensor,
-        num_targets: torch.Tensor,
-        seq_payloads: Dict[str, torch.Tensor],
-    ) -> Tuple[int, int, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+    def get_item_embeddings(self, item_ids: torch.Tensor) -> torch.Tensor:
         """
-        Process input embeddings and pass through metadata.
+        HSTU's API requires this method, but we won't use it.
+        Our embeddings are pre-computed by UniGCR's InputLayer.
+
+        Returns zero embeddings (will be overridden by past_embeddings parameter).
 
         Args:
-            All parameters from HSTUTransducer's expected input format
+            item_ids: (B, N) item IDs
 
         Returns:
-            Tuple of (max_seq_len, total_uih_len, total_targets, seq_lengths,
-                     seq_offsets, seq_timestamps, seq_embeddings, num_targets, seq_payloads)
+            Zero embeddings of shape (B, N, D)
         """
-        # Scale embeddings for better gradient flow
-        seq_embeddings = seq_embeddings * self.scale
-
-        # Apply dropout during training
-        if self.training and self.dropout > 0:
-            seq_embeddings = F.dropout(seq_embeddings, p=self.dropout, training=True)
-
-        # Compute sequence offsets (required by HSTUTransducer)
-        try:
-            seq_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(seq_lengths)
-        except (AttributeError, RuntimeError):
-            # Fallback if fbgemm not available
-            seq_offsets = torch.cat([
-                torch.zeros(1, dtype=seq_lengths.dtype, device=seq_lengths.device),
-                torch.cumsum(seq_lengths, dim=0)
-            ])
-
-        # Compute max_seq_len (total sequence length)
-        max_seq_len = max_uih_len + max_targets
-
-        # Return in CORRECT order matching ContextualPreprocessor signature
-        return (
-            max_seq_len,      # Total max sequence length
-            total_uih_len,    # Total history tokens
-            total_targets,    # Total target tokens
-            seq_lengths,      # Sequence lengths (B,)
-            seq_offsets,      # Sequence offsets (B+1,) - CRITICAL!
-            seq_timestamps,   # Timestamps
-            seq_embeddings,   # Processed embeddings
-            num_targets,      # Num targets per sample (B,)
-            seq_payloads,     # Payloads dict
+        batch_size, seq_len = item_ids.shape
+        return torch.zeros(
+            batch_size, seq_len, self.embedding_dim,
+            dtype=torch.float32,
+            device=item_ids.device
         )
 
-    def interleave_targets(
-        self,
-        seq_embeddings: torch.Tensor,
-        target_embeddings: torch.Tensor,
-        seq_offsets: torch.Tensor,
-        num_targets: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Interleave target embeddings into sequence embeddings.
-
-        This is an abstract method from InputPreprocessor. For our use case,
-        we don't need complex interleaving logic - targets are already part
-        of the sequence.
-
-        Args:
-            seq_embeddings: Sequence embeddings
-            target_embeddings: Target embeddings
-            seq_offsets: Sequence offsets
-            num_targets: Number of targets per sequence
-
-        Returns:
-            Interleaved embeddings (in our case, just concatenate)
-        """
-        # Simple concatenation - targets follow history
-        return torch.cat([seq_embeddings, target_embeddings], dim=0)
+    def get_item_embedding_dim(self) -> int:
+        """Return embedding dimension."""
+        return self.embedding_dim
 
 
-def build_stu_module(config: UniGCRConfig) -> STUStack:
+def build_embedding_module(config: UniGCRConfig) -> PassthroughEmbeddingModule:
     """
-    Build STU (Sequential Transduction Unit) module stack.
+    Build passthrough embedding module.
 
-    The STU module is the core sequence processing engine that performs
-    hierarchical attention over the sequence.
+    NOTE: Actual embeddings are computed by UniGCR's InputLayer which handles
+    the 3-token-per-item semantic ID format from RQ-VAE.
 
     Args:
-        config: UniGCRConfig with parameters:
-            - embed_dim: Embedding dimension
-            - hstu_layers: Number of STU layers to stack
-            - hstu_heads: Number of attention heads
-            - dropout: Dropout rate
-            - max_seq_len: Maximum sequence length
-            - attn_alpha: Attention scaling factor (default: 1.0)
+        config: UniGCR configuration
 
     Returns:
-        STUStack containing configured STU layers
+        PassthroughEmbeddingModule instance
+    """
+    return PassthroughEmbeddingModule(embedding_dim=config.embed_dim)
+
+
+def build_similarity_module() -> SimilarityModule:
+    """
+    Build similarity module for Research HSTU.
+
+    Used by HSTU for computing similarity scores between user and item embeddings.
+    Dot product similarity is standard for recommendation tasks.
+
+    Returns:
+        DotProductSimilarity instance
+    """
+    if not GENERATIVE_RECOMMENDERS_AVAILABLE:
+        raise ImportError("generative_recommenders not available")
+
+    return DotProductSimilarity()
+
+
+def build_input_preprocessor(config: UniGCRConfig) -> InputFeaturesPreprocessorModule:
+    """
+    Build input features preprocessor for Research HSTU.
+
+    Adds learnable positional embeddings to item embeddings and applies dropout.
+    This is similar to transformer positional encodings but learned during training.
+
+    Args:
+        config: UniGCR configuration
+
+    Returns:
+        LearnablePositionalEmbeddingInputFeaturesPreprocessor instance
+    """
+    if not GENERATIVE_RECOMMENDERS_AVAILABLE:
+        raise ImportError("generative_recommenders not available")
+
+    return LearnablePositionalEmbeddingInputFeaturesPreprocessor(
+        max_sequence_len=config.max_seq_len,
+        embedding_dim=config.embed_dim,
+        dropout_rate=config.dropout,
+    )
+
+
+def build_output_postprocessor(config: UniGCRConfig) -> OutputPostprocessorModule:
+    """
+    Build output postprocessor for Research HSTU.
+
+    Applies L2 normalization to output embeddings for better similarity computation.
+    This is standard practice in recommendation systems using dot product similarity.
+
+    Args:
+        config: UniGCR configuration
+
+    Returns:
+        L2NormEmbeddingPostprocessor instance
+    """
+    if not GENERATIVE_RECOMMENDERS_AVAILABLE:
+        raise ImportError("generative_recommenders not available")
+
+    return L2NormEmbeddingPostprocessor(
+        embedding_dim=config.embed_dim,
+        eps=1e-6,
+    )
+
+
+def build_research_hstu(config: UniGCRConfig) -> HSTU:
+    """
+    Build Research HSTU model for autoregressive next-item prediction.
+
+    Architecture:
+        Input: Pre-computed item embeddings from UniGCR's InputLayer (B, N, D)
+        Processing: HSTU layers with causal self-attention
+        Output: Contextualized item embeddings (B, N, D) for all positions
+
+    Configuration follows Meta's ICML'24 paper recommendations:
+    - Base model: 2 blocks, 1 head, dqk=dv=embedding_dim
+    - Large model: 8 blocks, 2 heads, dqk=dv=embedding_dim//2
+
+    Reference:
+        Paper: "Actions Speak Louder than Words: Trillion-Parameter Sequential
+               Transducers for Generative Recommendations" (ICML'24)
+        Repo: https://github.com/meta-recsys/generative-recommenders
+        File: generative_recommenders/research/modeling/sequential/hstu.py
+
+    Args:
+        config: UniGCR configuration
+
+    Returns:
+        HSTU instance ready for training
     """
     if not GENERATIVE_RECOMMENDERS_AVAILABLE:
         raise ImportError(
-            "generative_recommenders not installed. "
-            "Install via: pip install git+https://github.com/facebookresearch/generative-recommenders.git"
+            "generative_recommenders not available. "
+            "Please install: pip install generative-recommenders"
         )
 
-    # Configure STU layer
-    stu_config = STULayerConfig(
+    # Build required modules
+    embedding_module = build_embedding_module(config)
+    similarity_module = build_similarity_module()
+    input_preproc = build_input_preprocessor(config)
+    output_postproc = build_output_postprocessor(config)
+
+    # Determine attention and linear dimensions
+    # For base models, typically dqk = dv = embedding_dim
+    # For large models, can reduce to embedding_dim // 2
+    attention_dim = config.embed_dim  # dqk
+    linear_dim = config.embed_dim      # dv
+
+    # Create HSTU
+    hstu = HSTU(
+        # Sequence configuration
+        max_sequence_len=config.max_seq_len,
+        max_output_len=config.max_seq_len,
         embedding_dim=config.embed_dim,
-        num_heads=config.hstu_heads,
-        hidden_dim=config.embed_dim * 4,  # Standard FFN expansion (4x)
-        attention_dim=config.embed_dim,
-        output_dropout_ratio=config.dropout,
-        causal=True,  # Enable causal masking for autoregressive generation
-        target_aware=False,  # Not using target-aware attention
-        max_attn_len=config.max_seq_len,
-        attn_alpha=getattr(config, 'attn_alpha', 1.0),
-        use_group_norm=False,
-        # Optional advanced settings (using defaults)
-        recompute_normed_x=False,
-        recompute_uvqk=False,
-        recompute_y=False,
-        sort_by_length=False,
-        contextual_seq_len=0,
+
+        # Architecture configuration
+        num_blocks=config.hstu_layers,      # Number of STU layers (2 for base, 8 for large)
+        num_heads=config.hstu_heads,         # Number of attention heads (1 for base, 2 for large)
+        linear_dim=linear_dim,               # Dimension of linear/value projections (dv)
+        attention_dim=attention_dim,         # Dimension of query/key projections (dqk)
+
+        # Layer configuration
+        normalization="rel_bias",            # Relative bias normalization
+        linear_config="uvqk",                # Linear layer config: u, v, q, k projections
+        linear_activation="silu",            # SiLU (Swish) activation
+
+        # Dropout
+        linear_dropout_rate=config.dropout,
+        attn_dropout_rate=config.dropout,
+
+        # Required modules
+        embedding_module=embedding_module,
+        similarity_module=similarity_module,
+        input_features_preproc_module=input_preproc,
+        output_postproc_module=output_postproc,
+
+        # Optional features
+        enable_relative_attention_bias=True,  # Use temporal/positional bias
+        concat_ua=False,                      # No user attributes concatenation
+        verbose=False,                        # Disable verbose logging
     )
 
-    # Create multiple STU layers
-    stu_layers = [
-        STULayer(config=stu_config, is_inference=False)
-        for _ in range(config.hstu_layers)
-    ]
-
-    return STUStack(stu_list=stu_layers, is_inference=False)
+    return hstu
 
 
-def build_input_preprocessor(config: UniGCRConfig) -> MinimalInputPreprocessor:
+# For backward compatibility / alternative builder interface
+def build_hstu_transducer(config: UniGCRConfig) -> HSTU:
     """
-    Build input preprocessor for HSTUTransducer.
+    Legacy function name for backward compatibility.
+    Now builds Research HSTU instead of HSTUTransducer.
 
     Args:
-        config: UniGCRConfig with embed_dim and dropout
+        config: UniGCR configuration
 
     Returns:
-        MinimalInputPreprocessor instance
+        HSTU instance (Research HSTU, not HSTUTransducer)
     """
-    return MinimalInputPreprocessor(
-        embedding_dim=config.embed_dim,
-        dropout=config.dropout,
-        is_inference=False
-    )
-
-
-def build_output_postprocessor(config: UniGCRConfig) -> L2NormPostprocessor:
-    """
-    Build output postprocessor for HSTUTransducer.
-
-    Uses L2 normalization which:
-    - Normalizes embeddings to unit length
-    - Improves training stability
-    - Ignores timestamp inputs (suitable for our use case without temporal data)
-
-    Args:
-        config: UniGCRConfig (not used, kept for API consistency)
-
-    Returns:
-        L2NormPostprocessor instance
-    """
-    if not GENERATIVE_RECOMMENDERS_AVAILABLE:
-        raise ImportError("generative_recommenders not installed")
-
-    return L2NormPostprocessor(is_inference=False)
-
-
-def build_hstu_transducer(config: UniGCRConfig) -> HSTUTransducer:
-    """
-    Build complete HSTUTransducer for Uni-GCR generative retrieval.
-
-    This function creates all necessary components and assembles them into
-    a complete HSTUTransducer module ready for training.
-
-    Args:
-        config: UniGCRConfig with all necessary parameters
-
-    Returns:
-        Configured HSTUTransducer instance
-
-    Example:
-        >>> config = UniGCRConfig(
-        ...     embed_dim=64,
-        ...     hstu_layers=2,
-        ...     hstu_heads=2,
-        ...     dropout=0.1,
-        ...     max_seq_len=150
-        ... )
-        >>> transducer = build_hstu_transducer(config)
-        >>> # Use in forward pass
-        >>> full_emb, cand_emb = transducer(...)
-    """
-    if not GENERATIVE_RECOMMENDERS_AVAILABLE:
-        raise ImportError(
-            "generative_recommenders not installed. "
-            "Install via: pip install git+https://github.com/facebookresearch/generative-recommenders.git"
-        )
-
-    # Build components
-    stu_module = build_stu_module(config)
-    preprocessor = build_input_preprocessor(config)
-    postprocessor = build_output_postprocessor(config)
-
-    # Assemble HSTUTransducer
-    transducer = HSTUTransducer(
-        stu_module=stu_module,
-        input_preprocessor=preprocessor,
-        output_postprocessor=postprocessor,
-        input_dropout_ratio=config.dropout,
-        positional_encoder=None,  # Our UnifiedInputLayer already handles embeddings
-        is_inference=False,  # Training mode
-        return_full_embeddings=True,  # CRITICAL: Need full sequence for GR loss
-        listwise=False,  # Not using listwise ranking
-    )
-
-    return transducer
+    return build_research_hstu(config)

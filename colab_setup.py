@@ -1,5 +1,5 @@
 """
-Google Colab Setup Script for Uni-GCR with HSTUTransducer
+Google Colab Setup Script for Uni-GCR with Research HSTU
 
 Run this in a Colab cell before testing.
 """
@@ -137,10 +137,10 @@ def setup_colab_environment():
     else:
         print("❌ Installation failed")
 
-    # Step 6.5: Patch generative_recommenders for compatibility
-    print("\n🔧 Step 6.5: Patch generative_recommenders for compatibility")
+    # Step 6.5: Patch generative_recommenders for compatibility (optional)
+    print("\n🔧 Step 6.5: Patch for compatibility (optional)")
 
-    # Patch 1: Make hammer imports optional
+    # Patch: Make hammer imports optional (Research HSTU might use it internally)
     hstu_attention_file = f"{gen_rec_path}/generative_recommenders/ops/hstu_attention.py"
 
     if os.path.exists(hstu_attention_file):
@@ -176,72 +176,7 @@ except ImportError:
         else:
             print("✅ hstu_attention.py already patched")
     else:
-        print(f"⚠️  File not found: {hstu_attention_file}")
-
-    # Patch 2: Add fbgemm fallback in hstu_transducer.py
-    hstu_transducer_file = f"{gen_rec_path}/generative_recommenders/modules/hstu_transducer.py"
-
-    if os.path.exists(hstu_transducer_file):
-        with open(hstu_transducer_file, 'r') as f:
-            content = f.read()
-
-        if "# PATCHED: fbgemm fallback" not in content:
-            print("▶️  Patching hstu_transducer.py for fbgemm compatibility...")
-
-            # Pattern 1: First fbgemm call in _postprocess
-            pattern1 = """        uih_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
-            seq_lengths - num_targets
-        )"""
-
-            replacement1 = """        # PATCHED: fbgemm fallback
-        try:
-            uih_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
-                seq_lengths - num_targets
-            )
-        except (AttributeError, RuntimeError):
-            # Fallback if fbgemm operation not available
-            uih_offsets = torch.cat([
-                torch.zeros(1, dtype=seq_lengths.dtype, device=seq_lengths.device),
-                torch.cumsum(seq_lengths - num_targets, dim=0)
-            ])"""
-
-            # Pattern 2: Second fbgemm call in _postprocess
-            pattern2 = """        candidates_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
-            num_targets
-        )"""
-
-            replacement2 = """        try:
-            candidates_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
-                num_targets
-            )
-        except (AttributeError, RuntimeError):
-            # Fallback if fbgemm operation not available
-            candidates_offsets = torch.cat([
-                torch.zeros(1, dtype=num_targets.dtype, device=num_targets.device),
-                torch.cumsum(num_targets, dim=0)
-            ])"""
-
-            patched = False
-            if pattern1 in content:
-                content = content.replace(pattern1, replacement1)
-                patched = True
-                print("  ✓ Patched first fbgemm call (uih_offsets)")
-
-            if pattern2 in content:
-                content = content.replace(pattern2, replacement2)
-                patched = True
-                print("  ✓ Patched second fbgemm call (candidates_offsets)")
-
-            if patched:
-                with open(hstu_transducer_file, 'w') as f:
-                    f.write(content)
-                print("✅ Successfully patched hstu_transducer.py")
-            else:
-                print("⚠️  Could not find fbgemm patterns (may be version mismatch)")
-        else:
-            print("✅ hstu_transducer.py already patched")
-    else:
-        print(f"⚠️  File not found: {hstu_transducer_file}")
+        print(f"⚠️  File not found: {hstu_attention_file} (not critical for Research HSTU)")
 
     # Step 7: Verify installation
     print("\n✅ Step 7: Verify Installation")
@@ -255,18 +190,17 @@ except ImportError:
         # Invalidate caches to ensure patched file is re-imported
         importlib.invalidate_caches()
 
-        from generative_recommenders.modules.stu import STULayer
-        from generative_recommenders.modules.hstu_transducer import HSTUTransducer
-        print("✅ generative_recommenders imports successfully!")
+        # Test Research HSTU imports
+        from generative_recommenders.research.modeling.sequential.hstu import HSTU
+        print("✅ Research HSTU imports successfully!")
         return True
     except ImportError as e:
         error_msg = str(e)
-        print(f"❌ Import failed after patching: {error_msg}")
+        print(f"❌ Import failed: {error_msg}")
         print("\n💡 Troubleshooting:")
-        print("  1. The patch may not have applied correctly")
-        print("  2. Try restarting Colab runtime: Runtime → Restart runtime")
-        print("  3. Delete /content/generative_recommenders and re-run setup")
-        print(f"  4. Error details: {error_msg}")
+        print("  1. Try restarting Colab runtime: Runtime → Restart runtime")
+        print("  2. Delete /content/generative_recommenders and re-run setup")
+        print(f"  3. Error details: {error_msg}")
         import traceback
         print(traceback.format_exc())
         return False
@@ -281,23 +215,37 @@ def quick_test():
         import torch
         print(f"✅ PyTorch: {torch.__version__}")
 
-        from generative_recommenders.modules.stu import STULayer, STULayerConfig
-        print("✅ STU modules")
+        # Test Research HSTU imports
+        from generative_recommenders.research.modeling.sequential.hstu import HSTU
+        print("✅ Research HSTU")
 
-        from generative_recommenders.modules.hstu_transducer import HSTUTransducer
-        print("✅ HSTUTransducer")
+        from generative_recommenders.research.modeling.sequential.embedding_modules import (
+            LocalEmbeddingModule,
+        )
+        print("✅ LocalEmbeddingModule")
 
-        from generative_recommenders.modules.preprocessors import InputPreprocessor
-        print("✅ InputPreprocessor")
+        from generative_recommenders.research.modeling.sequential.input_features_preprocessors import (
+            LearnablePositionalEmbeddingInputFeaturesPreprocessor,
+        )
+        print("✅ LearnablePositionalEmbeddingInputFeaturesPreprocessor")
 
-        from generative_recommenders.modules.postprocessors import L2NormPostprocessor
-        print("✅ L2NormPostprocessor")
+        from generative_recommenders.research.modeling.sequential.output_postprocessors import (
+            L2NormEmbeddingPostprocessor,
+        )
+        print("✅ L2NormEmbeddingPostprocessor")
+
+        from generative_recommenders.research.rails.similarities.dot_product_similarity_fn import (
+            DotProductSimilarity,
+        )
+        print("✅ DotProductSimilarity")
 
         print("\n🎉 All imports successful! Ready to run integration test.")
         return True
 
     except ImportError as e:
         print(f"\n❌ Import error: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 if __name__ == "__main__":
