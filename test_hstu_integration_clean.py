@@ -5,178 +5,46 @@ This script tests:
 1. Model instantiation with Research HSTU
 2. Forward pass with mock data
 3. Output shape verification
+
+NO FALLBACKS - requires native fbgemm operations
 """
 
 import torch
 import sys
 import os
 
-# Patch fbgemm compatibility issues if needed
+# Check fbgemm operations (NO FALLBACKS)
 print("🔧 Checking fbgemm operations...")
 
-# Global registry to track batch metadata across forward pass
-# Since HSTU creates new tensors during operations (different data_ptr),
-# we track the batch structure globally rather than per-tensor
-_BATCH_METADATA = {
-    'batch_size': None,
-    'max_seq_len': None,
-    'offsets': None,
-    'device': None,
-}
+required_ops = ['asynchronous_complete_cumsum', 'dense_to_jagged', 'jagged_to_padded_dense']
+missing_ops = []
 
-if not hasattr(torch.ops.fbgemm, 'asynchronous_complete_cumsum'):
-    print("⚠️  Patching fbgemm.asynchronous_complete_cumsum...")
-    def async_cumsum_fallback(lengths):
-        """Fallback implementation using torch.cumsum"""
-        return torch.cat([
-            torch.zeros(1, dtype=lengths.dtype, device=lengths.device),
-            torch.cumsum(lengths, dim=0)
-        ])
-    torch.ops.fbgemm.asynchronous_complete_cumsum = async_cumsum_fallback
-    print("✅ Patch applied!")
+for op in required_ops:
+    if hasattr(torch.ops.fbgemm, op):
+        print(f"✅ {op} available")
+    else:
+        print(f"❌ {op} MISSING")
+        missing_ops.append(op)
 
-# Simple wrapper class to carry offsets with jagged tensors
-class JaggedTensorWrapper:
-    """Mimics fbgemm's JaggedTensor by carrying offsets with the values."""
-    def __init__(self, values, offsets):
-        self._values = values
-        self._offsets = offsets
+if missing_ops:
+    print(f"\n❌ ERROR: {len(missing_ops)}/3 required fbgemm operations are missing!")
+    print("\nMissing operations:")
+    for op in missing_ops:
+        print(f"  - torch.ops.fbgemm.{op}")
 
-    def values(self):
-        return self._values
+    print("\nAvailable fbgemm operations:")
+    available = [op for op in dir(torch.ops.fbgemm) if not op.startswith('_')]
+    if available:
+        for op in available[:20]:
+            print(f"  - {op}")
+    else:
+        print("  (none found)")
 
-    def offsets(self):
-        return self._offsets
+    print("\n💡 Fix: Install fbgemm-gpu with these operations")
+    print("   Try different sources/versions in colab_setup_simple.py")
+    sys.exit(1)
 
-    # Support tuple unpacking for backward compatibility
-    def __iter__(self):
-        return iter((self._values, {"offsets": self._offsets}))
-
-    def __getitem__(self, idx):
-        if idx == 0:
-            return self._values
-        elif idx == 1:
-            return {"offsets": self._offsets}
-        raise IndexError("JaggedTensorWrapper index out of range")
-
-if not hasattr(torch.ops.fbgemm, 'dense_to_jagged'):
-    print("⚠️  Patching fbgemm.dense_to_jagged...")
-    def dense_to_jagged_fallback(dense, offsets_list):
-        """
-        Fallback: Convert dense (B, L, D) to jagged (sum(lengths), D).
-        Removes padding and flattens valid items.
-        Stores batch metadata globally for jagged_to_padded_dense reconstruction.
-        """
-        global _BATCH_METADATA
-        offsets = offsets_list[0]  # Offsets: [0, len0, len0+len1, ...]
-
-        # If offsets is 1D with just batch_size+1 elements, extract valid sequences
-        if offsets.dim() == 1 and len(offsets) == dense.size(0) + 1:
-            batch_size, max_len, dim = dense.shape
-            lengths = offsets[1:] - offsets[:-1]  # Compute lengths from offsets
-
-            # Store batch metadata globally (survives across tensor operations)
-            _BATCH_METADATA['batch_size'] = batch_size
-            _BATCH_METADATA['max_seq_len'] = max_len
-            _BATCH_METADATA['offsets'] = offsets
-            _BATCH_METADATA['device'] = dense.device
-
-            # Flatten valid items only
-            jagged_list = []
-            for i, length in enumerate(lengths):
-                jagged_list.append(dense[i, :length, :])  # Take only valid items
-
-            jagged = torch.cat(jagged_list, dim=0)  # (total_items, D)
-
-            # Return wrapper that preserves offsets for jagged_to_padded_dense
-            return JaggedTensorWrapper(jagged, offsets)
-        else:
-            # Fallback: assume no padding, create uniform offsets
-            flat = dense.view(-1, dense.size(-1))
-            batch_size = dense.size(0)
-            seq_len = dense.size(1)
-            offsets = torch.arange(0, (batch_size + 1) * seq_len, seq_len,
-                                 dtype=torch.long, device=dense.device)
-
-            # Store metadata
-            _BATCH_METADATA['batch_size'] = batch_size
-            _BATCH_METADATA['max_seq_len'] = seq_len
-            _BATCH_METADATA['offsets'] = offsets
-            _BATCH_METADATA['device'] = dense.device
-
-            return JaggedTensorWrapper(flat, offsets)
-
-    torch.ops.fbgemm.dense_to_jagged = dense_to_jagged_fallback
-    print("✅ Patch applied!")
-
-if not hasattr(torch.ops.fbgemm, 'jagged_to_padded_dense'):
-    print("⚠️  Patching fbgemm.jagged_to_padded_dense...")
-    def jagged_to_padded_dense_fallback(values, offsets_list=None, max_length=None, padding_value=0, **kwargs):
-        """
-        Fallback: Convert jagged (total_items, D) back to dense (B, L, D).
-
-        Handles:
-        1. JaggedTensorWrapper from our dense_to_jagged (carries offsets)
-        2. Tuple (values, metadata_dict) format
-        3. Raw tensors with explicit offsets_list
-        4. Raw tensors - uses global batch metadata from dense_to_jagged
-        """
-        global _BATCH_METADATA
-
-        # Case 1: If values is our JaggedTensorWrapper, extract values and offsets
-        if isinstance(values, JaggedTensorWrapper):
-            offsets = values.offsets()
-            values = values.values()
-            offsets_list = [offsets]  # Wrap in list for consistency
-
-        # Case 2: If values is a tuple, extract components
-        elif isinstance(values, tuple):
-            values, metadata = values
-            # Check if offsets are in metadata
-            if isinstance(metadata, dict) and "offsets" in metadata:
-                offsets_list = [metadata["offsets"]]
-
-        # Case 3: If offsets_list not provided, use global batch metadata
-        if offsets_list is None:
-            # Try to retrieve offsets from global metadata set by dense_to_jagged
-            if _BATCH_METADATA['offsets'] is not None:
-                offsets_list = [_BATCH_METADATA['offsets']]
-            else:
-                print("⚠️  jagged_to_padded_dense called without offsets and no global metadata")
-                print(f"   values shape: {values.shape}, max_length: {max_length}")
-                # Last resort: return as-is with added batch dim
-                return values.unsqueeze(0)
-
-        # Standard path with offsets
-        offsets = offsets_list[0] if isinstance(offsets_list, list) else offsets_list
-        batch_size = len(offsets) - 1
-        dim = values.size(-1)
-
-        # Auto-determine max_length if not provided
-        if max_length is None:
-            lengths = offsets[1:] - offsets[:-1]
-            max_length = int(lengths.max().item())
-
-        # Create padded tensor
-        padded = torch.full((batch_size, max_length, dim),
-                           padding_value,
-                           dtype=values.dtype,
-                           device=values.device)
-
-        # Fill in valid items
-        for i in range(batch_size):
-            start_idx = int(offsets[i].item())
-            end_idx = int(offsets[i + 1].item())
-            length = end_idx - start_idx
-            if length > 0:
-                padded[i, :length, :] = values[start_idx:end_idx, :]
-
-        return padded
-
-    torch.ops.fbgemm.jagged_to_padded_dense = jagged_to_padded_dense_fallback
-    print("✅ Patch applied!")
-
-print("✅ fbgemm patches complete!")
+print("✅ All required fbgemm operations available!\n")
 
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
@@ -343,7 +211,6 @@ def main():
 
     print("Migration Summary:")
     print("  ✓ Switched from HSTUTransducer → Research HSTU")
-    print("  ✓ Removed jagged tensor conversions (simpler pipeline)")
     print("  ✓ Fixed token-vs-item issue: HSTU now sees items, not tokens")
     print("  ✓ Separate embeddings per semantic layer (L0, L1, L2, Dedup)")
     print("  ✓ Four prediction heads for COMPLETE item prediction")
