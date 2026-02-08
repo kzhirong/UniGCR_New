@@ -167,13 +167,16 @@ class UniGCRModel(nn.Module):
         past_payloads = {}  # Can add timestamps here if needed
 
         # 5. Forward through Research HSTU
-        # Returns: (B, num_items, D) - contextualized item embeddings for ALL positions
-        full_embeddings = self.backbone(
+        # Returns: (B, max_output_len, D) - HSTU may pad output to max_output_len
+        full_embeddings_all = self.backbone(
             past_lengths=lengths,
             past_ids=past_ids,           # Dummy IDs (API requirement)
             past_embeddings=past_embeddings,  # Actual item embeddings (pre-computed)
             past_payloads=past_payloads,
-        )  # (B, num_items, D)
+        )  # (B, max_output_len, D) - may be larger than num_items
+
+        # Slice to only the actual number of items (HSTU pads to max_output_len internally)
+        full_embeddings = full_embeddings_all[:, :num_items, :]  # (B, num_items, D)
 
         # 6. Prediction heads - predict all 4 semantic tokens for complete items
         # Each position predicts the next item's [L0, L1, L2, Dedup] tokens

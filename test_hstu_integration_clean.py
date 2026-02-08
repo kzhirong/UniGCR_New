@@ -13,6 +13,8 @@ import torch
 import sys
 import os
 
+import fbgemm_gpu
+
 # Check fbgemm operations (NO FALLBACKS)
 print("🔧 Checking fbgemm operations...")
 

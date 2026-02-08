@@ -1,13 +1,12 @@
 """
 Simple Google Colab Setup Script for Uni-GCR with Research HSTU
-
-Just installs dependencies and checks what's available.
-You can modify fbgemm installation as needed.
+FIXED VERSION: Pins PyTorch 2.6.0 + FBGEMM 1.1.0 to resolve symbol errors.
 """
 
 import os
 import sys
 import subprocess
+import importlib
 
 def run_command(cmd, description=""):
     """Run shell command and print status."""
@@ -26,21 +25,60 @@ def run_command(cmd, description=""):
         return False
     return True
 
+def check_runtime_restart_needed():
+    """Checks if the loaded PyTorch version matches the installed one."""
+    try:
+        # Check what is installed on disk
+        import pkg_resources
+        installed_torch = pkg_resources.get_distribution("torch").version
+
+        # Check what is currently loaded in memory
+        import torch
+        loaded_torch = torch.__version__
+
+        if installed_torch != loaded_torch:
+            print("\n⚠️  RUNTIME RESTART REQUIRED ⚠️")
+            print(f"   Installed: {installed_torch}")
+            print(f"   Loaded:    {loaded_torch}")
+            print("   Colab pre-loaded the old version. You must restart the runtime to load the new one.")
+            return True
+    except:
+        pass
+    return False
+
 def setup_colab_environment():
     """Setup complete environment for Uni-GCR in Colab."""
 
     print("=" * 70)
-    print("Setting up Uni-GCR with Research HSTU (Simple Installation)")
+    print("Setting up Uni-GCR (Fixed for PyTorch 2.6.0 Compatibility)")
     print("=" * 70)
 
-    # Step 1: Check PyTorch version
-    print("\n🔥 Step 1: Check PyTorch and CUDA")
-    import torch
-    pytorch_version = torch.__version__
-    cuda_version = torch.version.cuda if torch.cuda.is_available() else None
+    # Step 1: Force Install Compatible Versions
+    print("\n📦 Step 1: Installing Compatible PyTorch 2.6.0 & FBGEMM 1.1.0")
 
-    print(f"✅ PyTorch: {pytorch_version}")
-    print(f"✅ CUDA: {cuda_version}")
+    # 1. Uninstall the default "Nightly" versions that cause the crash
+    run_command(
+        "pip uninstall -y torch torchvision torchaudio fbgemm-gpu torchrec",
+        "Cleaning up incompatible nightly versions..."
+    )
+
+    # 2. Install PyTorch 2.6.0 (Stable)
+    run_command(
+        "pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124",
+        "Installing PyTorch 2.6.0 (Stable)..."
+    )
+
+    # 3. Install FBGEMM 1.1.0 (Must match PyTorch 2.6)
+    run_command(
+        "pip install fbgemm-gpu==1.1.0 --index-url https://download.pytorch.org/whl/cu124",
+        "Installing FBGEMM 1.1.0..."
+    )
+
+    # 4. Install TorchRec 1.1.0 (Must match PyTorch 2.6)
+    run_command(
+        "pip install torchrec==1.1.0 --index-url https://download.pytorch.org/whl/cu124",
+        "Installing TorchRec 1.1.0..."
+    )
 
     # Step 2: Clone UniGCR repository
     print("\n📦 Step 2: Clone UniGCR Repository")
@@ -55,22 +93,6 @@ def setup_colab_environment():
             "cd /content/UniGCR_New && git pull",
             "Updating UniGCR...",
         )
-
-    # Step 3: Install fbgemm_gpu (SIMPLE - you can modify this)
-    print("\n📦 Step 3: Install fbgemm_gpu")
-    print("   You can modify this command to try different sources/versions")
-
-    run_command(
-        "pip install fbgemm-gpu",
-        "Installing fbgemm-gpu from PyPI..."
-    )
-
-    # Step 4: Install torchrec
-    print("\n📦 Step 4: Install torchrec")
-    run_command(
-        "pip install torchrec",
-        "Installing torchrec from PyPI..."
-    )
 
     # Step 5: Install other dependencies
     print("\n📦 Step 5: Install other dependencies")
@@ -93,10 +115,20 @@ def setup_colab_environment():
         print("✅ generative_recommenders already cloned")
 
     print("\n   Installing generative_recommenders...")
+    # CRITICAL: Use --no-deps to prevent it from upgrading torch back to incompatible versions
     run_command(
-        f"cd {gen_rec_path} && pip install -e .",
-        "Running pip install -e ..."
+        f"cd {gen_rec_path} && pip install --no-deps -e .",
+        "Running pip install -e (Safe Mode)..."
     )
+
+    # CHECK FOR RESTART
+    if check_runtime_restart_needed():
+        print("=" * 70)
+        print("🛑 STOPPING SCRIPT: PLEASE RESTART RUNTIME")
+        print("1. Go to 'Runtime' > 'Restart Session'")
+        print("2. Run this script again (It will skip installs and go to verification)")
+        print("=" * 70)
+        return False
 
     # Step 7: Check fbgemm operations availability
     print("\n🔧 Step 7: Check fbgemm operations")
@@ -125,12 +157,6 @@ def setup_colab_environment():
 
     if missing_ops:
         print(f"\n❌ {len(missing_ops)}/3 operations missing!")
-        print("\n   Debugging info:")
-        print(f"   Available fbgemm operations: {[op for op in dir(torch.ops.fbgemm) if not op.startswith('_')][:20]}")
-        print("\n   Try modifying Step 3 to install fbgemm from different source:")
-        print("   - PyTorch wheel index: pip install fbgemm-gpu --index-url https://download.pytorch.org/whl/cu121")
-        print("   - Specific version: pip install fbgemm-gpu==1.3.0")
-        print("   - Nightly: pip install fbgemm-gpu-nightly")
         return False
     else:
         print("\n🎉 All required operations available!")
@@ -165,8 +191,4 @@ if __name__ == "__main__":
     if success:
         print_summary()
     else:
-        print("\n❌ Setup incomplete - see errors above")
-        print("\n💡 Tips:")
-        print("  1. Check fbgemm-gpu version compatibility with your PyTorch version")
-        print("  2. Try different installation sources (see Step 3 output)")
-        print("  3. Check CUDA version compatibility")
+        print("\n❌ Setup incomplete / Restart Required")
