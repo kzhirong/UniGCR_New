@@ -11,6 +11,83 @@ import torch
 import sys
 import os
 
+# Patch fbgemm compatibility issues if needed
+print("🔧 Checking fbgemm operations...")
+
+if not hasattr(torch.ops.fbgemm, 'asynchronous_complete_cumsum'):
+    print("⚠️  Patching fbgemm.asynchronous_complete_cumsum...")
+    def async_cumsum_fallback(lengths):
+        """Fallback implementation using torch.cumsum"""
+        return torch.cat([
+            torch.zeros(1, dtype=lengths.dtype, device=lengths.device),
+            torch.cumsum(lengths, dim=0)
+        ])
+    torch.ops.fbgemm.asynchronous_complete_cumsum = async_cumsum_fallback
+    print("✅ Patch applied!")
+
+if not hasattr(torch.ops.fbgemm, 'dense_to_jagged'):
+    print("⚠️  Patching fbgemm.dense_to_jagged...")
+    def dense_to_jagged_fallback(dense, offsets_list):
+        """
+        Fallback: Convert dense (B, L, D) to jagged (sum(lengths), D).
+        Removes padding and flattens valid items.
+        """
+        offsets = offsets_list[0]  # Offsets: [0, len0, len0+len1, ...]
+
+        # If offsets is 1D with just batch_size+1 elements, extract valid sequences
+        if offsets.dim() == 1 and len(offsets) == dense.size(0) + 1:
+            batch_size, max_len, dim = dense.shape
+            lengths = offsets[1:] - offsets[:-1]  # Compute lengths from offsets
+
+            # Flatten valid items only
+            jagged_list = []
+            for i, length in enumerate(lengths):
+                jagged_list.append(dense[i, :length, :])  # Take only valid items
+
+            jagged = torch.cat(jagged_list, dim=0)  # (total_items, D)
+            return (jagged, {})
+        else:
+            # Fallback: assume no padding
+            return (dense.view(-1, dense.size(-1)), {})
+
+    torch.ops.fbgemm.dense_to_jagged = dense_to_jagged_fallback
+    print("✅ Patch applied!")
+
+if not hasattr(torch.ops.fbgemm, 'jagged_to_padded_dense'):
+    print("⚠️  Patching fbgemm.jagged_to_padded_dense...")
+    def jagged_to_padded_dense_fallback(values, offsets_list, max_length, padding_value=0, **kwargs):
+        """
+        Fallback: Convert jagged (total_items, D) back to dense (B, L, D).
+        Note: Parameter is 'values' not 'jagged' to match fbgemm API signature.
+        """
+        # If values is a tuple from dense_to_jagged, extract first element
+        if isinstance(values, tuple):
+            values = values[0]
+
+        offsets = offsets_list[0]
+        batch_size = len(offsets) - 1
+        dim = values.size(-1)
+
+        # Create padded tensor
+        padded = torch.full((batch_size, max_length, dim),
+                           padding_value,
+                           dtype=values.dtype,
+                           device=values.device)
+
+        # Fill in valid items
+        for i in range(batch_size):
+            start_idx = offsets[i]
+            end_idx = offsets[i + 1]
+            length = end_idx - start_idx
+            padded[i, :length, :] = values[start_idx:end_idx, :]
+
+        return padded
+
+    torch.ops.fbgemm.jagged_to_padded_dense = jagged_to_padded_dense_fallback
+    print("✅ Patch applied!")
+
+print("✅ fbgemm patches complete!")
+
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 

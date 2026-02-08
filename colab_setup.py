@@ -50,22 +50,34 @@ def setup_colab_environment():
     # Step 3: Install fbgemm_gpu (required by generative_recommenders)
     print("\n📦 Step 3: Install fbgemm_gpu")
     print("⚠️  This may take 5-10 minutes...")
+    print("ℹ️  Installing from PyTorch wheel index (not PyPI) to get full CUDA ops")
 
-    # Determine CUDA version for fbgemm
+    # Determine CUDA version and prepare PyTorch wheel index URL
     cuda_version = torch.version.cuda
-    if cuda_version:
-        cuda_major = cuda_version.split('.')[0]
-        fbgemm_package = f"fbgemm-gpu==1.0.0"  # Use version compatible with PyTorch
+    cuda_tag = None
+    torch_index_url = None
 
+    if cuda_version:
+        # Format CUDA version for PyTorch index (e.g., "12.1" -> "cu121")
+        cuda_version_str = cuda_version.replace('.', '')[:4]  # "12.1" -> "121" -> "cu121"
+        if len(cuda_version_str) == 2:  # "11.8" -> "118"
+            cuda_version_str = cuda_version_str + "0"
+        cuda_tag = f"cu{cuda_version_str}"
+
+        # Install from PyTorch's wheel index (has FULL fbgemm-gpu with all operations)
+        torch_index_url = f"https://download.pytorch.org/whl/{cuda_tag}/"
+
+        print(f"   Installing for CUDA {cuda_version} (using {cuda_tag} wheels)")
         success = run_command(
-            f"pip install {fbgemm_package} --no-cache-dir",
-            f"Installing fbgemm_gpu for CUDA {cuda_version}..."
+            f"pip install fbgemm-gpu --index-url {torch_index_url} --no-cache-dir",
+            f"Installing fbgemm-gpu from PyTorch wheel index..."
         )
+
         if not success:
-            print("⚠️  fbgemm_gpu installation failed, trying CPU version...")
+            print("⚠️  PyTorch wheel index failed, trying PyPI (may have limited ops)...")
             run_command(
-                "pip install fbgemm-gpu-cpu --no-cache-dir",
-                "Installing CPU version as fallback..."
+                "pip install 'fbgemm-gpu>=1.1.0' --no-cache-dir",
+                "Installing from PyPI as fallback..."
             )
     else:
         print("No CUDA detected, installing CPU version")
@@ -76,10 +88,24 @@ def setup_colab_environment():
 
     # Step 4: Install torchrec (required by generative_recommenders)
     print("\n📦 Step 4: Install torchrec")
-    run_command(
-        "pip install torchrec --no-cache-dir",
-        "Installing torchrec..."
-    )
+    if torch_index_url:
+        # Also install torchrec from PyTorch wheel index for consistency
+        print(f"   Installing from PyTorch wheel index ({cuda_tag})...")
+        success = run_command(
+            f"pip install torchrec --index-url {torch_index_url} --no-cache-dir",
+            "Installing torchrec from PyTorch wheel index..."
+        )
+        if not success:
+            print("⚠️  PyTorch wheel index failed, trying PyPI...")
+            run_command(
+                "pip install torchrec --no-cache-dir",
+                "Installing from PyPI as fallback..."
+            )
+    else:
+        run_command(
+            "pip install torchrec --no-cache-dir",
+            "Installing torchrec (CPU)..."
+        )
 
     # Step 5: Install other dependencies
     print("\n📦 Step 5: Install other dependencies")
@@ -178,25 +204,25 @@ except ImportError:
     else:
         print(f"⚠️  File not found: {hstu_attention_file} (not critical for Research HSTU)")
 
-    # Step 7: Patch fbgemm compatibility issues
-    print("\n🔧 Step 7: Patch fbgemm compatibility")
+    # Step 7: Verify fbgemm operations (should now be available with fbgemm-gpu>=1.1.0)
+    print("\n🔧 Step 7: Verify fbgemm operations")
 
-    # Patch missing asynchronous_complete_cumsum
     import torch
+    missing_ops = []
+
     if not hasattr(torch.ops.fbgemm, 'asynchronous_complete_cumsum'):
-        print("⚠️  fbgemm.asynchronous_complete_cumsum not found, adding fallback...")
+        missing_ops.append('asynchronous_complete_cumsum')
+    if not hasattr(torch.ops.fbgemm, 'dense_to_jagged'):
+        missing_ops.append('dense_to_jagged')
+    if not hasattr(torch.ops.fbgemm, 'jagged_to_padded_dense'):
+        missing_ops.append('jagged_to_padded_dense')
 
-        def async_cumsum_fallback(lengths):
-            """Fallback implementation using torch.cumsum"""
-            return torch.cat([
-                torch.zeros(1, dtype=lengths.dtype, device=lengths.device),
-                torch.cumsum(lengths, dim=0)
-            ])
-
-        torch.ops.fbgemm.asynchronous_complete_cumsum = async_cumsum_fallback
-        print("✅ Registered fallback for asynchronous_complete_cumsum")
+    if missing_ops:
+        print(f"⚠️  Warning: fbgemm operations still missing: {missing_ops}")
+        print("   This may happen if fbgemm-gpu installation didn't include CUDA ops")
+        print("   The test file includes fallback implementations")
     else:
-        print("✅ fbgemm.asynchronous_complete_cumsum already available")
+        print("✅ All required fbgemm operations available!")
 
     # Step 8: Verify installation
     print("\n✅ Step 8: Verify Installation")
