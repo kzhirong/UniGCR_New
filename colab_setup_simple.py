@@ -97,7 +97,7 @@ def setup_colab_environment():
     # Step 5: Install other dependencies
     print("\n📦 Step 5: Install other dependencies")
     run_command(
-        "pip install numpy pandas scikit-learn tqdm iopath gin-config",
+        "pip install numpy pandas scikit-learn tqdm iopath gin-config deepspeed",
         "Installing Python packages..."
     )
 

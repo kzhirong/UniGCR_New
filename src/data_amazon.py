@@ -114,10 +114,14 @@ class AmazonBeautyDataset(Dataset):
             # Construct full sequence: History + Target
             full_seq = seq_codes + tgt_codes
 
+            # Track actual length before padding (for variable-length attention)
+            actual_length = len(full_seq) - 1  # Subtract 1 because we'll take [:-1] for input
+
             # Truncate/pad to max_seq_len
             max_len = self.config.max_seq_len
             if len(full_seq) > max_len:
                 full_seq = full_seq[-max_len:]
+                actual_length = max_len - 1  # All tokens are valid after truncation
             else:
                 full_seq = [0] * (max_len - len(full_seq)) + full_seq
 
@@ -125,6 +129,10 @@ class AmazonBeautyDataset(Dataset):
             # Label: all tokens except first (shifted by 1)
             output['sem_history'] = torch.tensor(full_seq[:-1], dtype=torch.long)
             output['sem_target'] = torch.tensor(full_seq[1:], dtype=torch.long)
+
+            # Lengths: actual (non-padded) sequence length in tokens
+            # Model uses this for variable-length masking in HSTU
+            output['lengths'] = torch.tensor(actual_length, dtype=torch.long)
 
             # For CTR task (if enabled): target item codes
             output['ctr_pos_codes'] = torch.tensor(tgt_codes, dtype=torch.long)

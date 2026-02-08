@@ -12,9 +12,9 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Uni-GCR Training Launch")
 
     # 允许命令行覆盖部分关键参数
-    parser.add_argument('--data_path', type=str, default='data/Beauty_5.json')
-    parser.add_argument('--grid_mapping', type=str, default='data/beauty/semantic_ids.json',
-                        help='Path to GRID generated mapping json')
+    parser.add_argument('--data_path', type=str, default='data/train_sequences.json')
+    parser.add_argument('--grid_mapping', type=str, default='data/semantic_id_kmean.pt',
+                        help='Path to semantic ID mapping (RQ-VAE + Dedup)')
 
     # 注册 DeepSpeed 参数 (这会自动添加 --deepspeed_config, --local_rank 等)
     parser = deepspeed.add_config_arguments(parser)
@@ -36,8 +36,9 @@ def main():
     # A. 核心任务: GR 预测 Semantic ID
     conf.use_semantic_seq = True
     conf.grid_mapping_path = args.grid_mapping
-    conf.sem_id_layers = 3          # 假设 GRID 是 3 层 (3x8)
-    conf.sem_id_codebook_size = 256
+    conf.sem_id_layers = 4          # 4 layers: [L0, L1, L2, Dedup]
+    conf.sem_id_codebook_size = 256  # Vocab size for L0, L1, L2
+    conf.sem_id_dedup_size = 19      # Vocab size for Dedup layer (0-18)
     
     # B. 辅助特征: Atomic ID (仅作 Input Context)
     conf.use_atomic_seq = False
