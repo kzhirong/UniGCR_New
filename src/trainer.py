@@ -345,13 +345,13 @@ class UniGCRTrainer:
 
             # DEBUG: Check candidates on first batch
             if is_main_process() and all_gr_count == 0:
-                print(f"\n[DEBUG] After offset fix:")
+                print(f"\n[DEBUG] Candidate predictions (Weighted Hamming Distance):")
                 print(f"  Candidates shape: {candidates.shape}")
                 print(f"  First 3 users, first 5 candidates each:")
                 for i in range(min(3, candidates.size(0))):
                     print(f"    User {i}: {candidates[i, :5].tolist()}")
-                print(f"  Unique candidates: {torch.unique(candidates).size(0)}")
-                print(f"  Min/Max: {candidates.min().item()}/{candidates.max().item()}")
+                print(f"  Unique candidates across all users: {torch.unique(candidates).size(0)}")
+                print(f"  Candidate range: [{candidates.min().item()}, {candidates.max().item()}]")
 
             # Compute Hit@k and NDCG@k
             # sem_target_eval: (B,) - ground truth item indices

@@ -400,47 +400,41 @@ class UniGCRModel(nn.Module):
         B, beam_width, num_layers = beam_results.shape
 
         # Flatten to (B*k, num_layers) for batch processing
-        codes_flat = beam_results.view(-1, num_layers)
+        codes_flat = beam_results.view(-1, num_layers)  # (B*k, 4) - RAW codes
 
-        # Convert each semantic code sequence to item ID
-        item_indices = []
-        debug_printed = False
-        for i in range(codes_flat.size(0)):
-            codes_raw = codes_flat[i].cpu().tolist()  # RAW codes: [0-255, 0-255, 0-255, 0-18]
+        # Convert semantic codes to item IDs using vectorized batch lookup
+        if grid_mapper:
+            # Apply offsets to entire batch at once
+            # RAW codes: [0-255, 0-255, 0-255, 0-18]
+            # Offset codes: [L0+1, L1+257, L2+513, Dedup+769]
+            offsets = torch.tensor([1, 257, 513, 769], device=codes_flat.device)
+            codes_offset = codes_flat + offsets  # (B*k, 4)
 
-            # Use grid_mapper to reverse lookup: semantic_codes -> item_id
-            if grid_mapper:
-                # IMPORTANT: grid_mapper.codes_to_item() expects OFFSET codes!
-                # Apply offsets: [L0+1, L1+257, L2+513, Dedup+769]
-                codes_offset = grid_mapper._apply_offset(codes_raw)
+            # DEBUG: Print first 3 lookups before batch processing (only first batch)
+            if codes_offset.size(0) >= 10:  # Only print for first batch
+                print(f"\n[DEBUG] Batch nearest neighbor lookup:")
+                print(f"  Batch size: {codes_offset.size(0)} predictions")
+                for i in range(min(3, codes_offset.size(0))):
+                    print(f"  Prediction {i}: raw={codes_flat[i].tolist()}, offset={codes_offset[i].tolist()}")
+                if codes_offset.size(0) > 0:
+                    sample_keys = list(grid_mapper.reverse_mapping.keys())[:5]
+                    print(f"  Sample valid codes: {sample_keys}")
+                    print(f"  [Note] Using Weighted Hamming Distance:")
+                    print(f"         - L0 weight=8 (coarse category)")
+                    print(f"         - L1 weight=4 (subcategory)")
+                    print(f"         - L2 weight=2 (details)")
+                    print(f"         - Dedup weight=1 (collision ID)")
+                    print(f"         - Perfect match=0, all wrong=15")
 
-                # Use nearest neighbor fallback for invalid code combinations
-                # (Model predicts layers independently, so not all combinations are valid)
-                item_id = grid_mapper.codes_to_item_nearest(codes_offset)
+            # Vectorized batch nearest neighbor lookup (FAST!)
+            # This replaces the slow loop with a single batched operation
+            # Uses Weighted Hamming Distance (hierarchical layer importance)
+            candidates = grid_mapper.codes_to_item_nearest_batch(codes_offset)  # (B*k,)
 
-                # DEBUG: Print first 3 lookups to diagnose the issue
-                if not debug_printed and i < 3:
-                    print(f"\n[DEBUG] Lookup #{i}:")
-                    print(f"  codes_raw: {codes_raw}")
-                    print(f"  codes_offset: {codes_offset}")
-                    print(f"  item_id result: {item_id} (nearest neighbor)")
-                    if i == 0:
-                        # Print sample of reverse_mapping keys
-                        sample_keys = list(grid_mapper.reverse_mapping.keys())[:5]
-                        print(f"  Sample reverse_mapping keys: {sample_keys}")
-                        print(f"  Total keys in reverse_mapping: {len(grid_mapper.reverse_mapping)}")
-                        print(f"  [Note] Model predicts layers independently → most predictions need NN mapping")
-                    if i == 2:
-                        debug_printed = True
-
-                # If code doesn't map to any item (shouldn't happen), use 0
-                item_indices.append(item_id if item_id is not None else 0)
-            else:
-                # Fallback if no grid_mapper provided
-                item_indices.append(0)
-
-        # 4. Reshape back to (B, k)
-        candidates = torch.tensor(item_indices, dtype=torch.long, device=u.device)
-        candidates = candidates.view(B, beam_width)
+            # Reshape to (B, k)
+            candidates = candidates.view(B, beam_width)
+        else:
+            # Fallback if no grid_mapper provided
+            candidates = torch.zeros(B, beam_width, dtype=torch.long, device=codes_flat.device)
 
         return candidates

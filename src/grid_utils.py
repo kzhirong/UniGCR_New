@@ -50,6 +50,11 @@ class GridMapper:
                 offset_codes = tuple(self._apply_offset(codes))
                 self.reverse_mapping[offset_codes] = item_id
 
+        # Build vectorized lookup table for fast nearest neighbor search
+        # Shape: (num_items, num_layers)
+        if self.reverse_mapping:
+            self._build_vectorized_lookup()
+
     def _auto_detect_structure(self):
         """
         Auto-detect number of layers and codebook size per layer from actual data
@@ -163,6 +168,89 @@ class GridMapper:
                 best_item = item_id
 
         return best_item
+
+    def _build_vectorized_lookup(self):
+        """
+        Build vectorized tensors for fast batch nearest neighbor search.
+        Precomputes all valid code combinations and their item IDs.
+        """
+        # Extract all valid codes and item IDs
+        valid_codes_list = []
+        item_ids_list = []
+
+        for codes, item_id in self.reverse_mapping.items():
+            valid_codes_list.append(list(codes))
+            item_ids_list.append(item_id)
+
+        # Convert to tensors: (num_items, num_layers)
+        self.valid_codes_tensor = torch.tensor(valid_codes_list, dtype=torch.long)  # (N, 4)
+        self.item_ids_tensor = torch.tensor(item_ids_list, dtype=torch.long)  # (N,)
+
+        print(f"[GridMapper] Built vectorized lookup: {self.valid_codes_tensor.shape[0]} items")
+
+    def codes_to_item_nearest_batch(self, codes_batch, use_weighted_hamming=True):
+        """
+        Vectorized batch nearest neighbor lookup using Weighted Hamming Distance.
+
+        Weighted Hamming Distance is appropriate for semantic codes because:
+        - Semantic codes are discrete cluster labels (not continuous values)
+        - Earlier layers (L0, L1) are more important (coarse categories)
+        - Later layers (L2, Dedup) encode finer details
+
+        Args:
+            codes_batch: Tensor of shape (batch_size, num_layers) with offset codes
+            use_weighted_hamming: If True, use weighted Hamming; if False, use L1 (legacy)
+
+        Returns:
+            item_ids: Tensor of shape (batch_size,) with item IDs
+        """
+        if not hasattr(self, 'valid_codes_tensor'):
+            # Fallback to single lookup if vectorized lookup not built
+            return torch.tensor([self.codes_to_item_nearest(codes) for codes in codes_batch])
+
+        # Move to same device as input
+        device = codes_batch.device
+        valid_codes = self.valid_codes_tensor.to(device)  # (N, 4)
+        item_ids = self.item_ids_tensor.to(device)  # (N,)
+
+        if use_weighted_hamming:
+            # ============================================================
+            # Weighted Hamming Distance (RECOMMENDED)
+            # ============================================================
+            # Treats codes as discrete labels, weights hierarchical importance
+
+            # Step 1: Compare codes element-wise (exact match check)
+            # codes_batch: (B, 4) -> (B, 1, 4)
+            # valid_codes: (N, 4) -> (1, N, 4)
+            # matches: (B, N, 4) - True where codes match
+            matches = (codes_batch.unsqueeze(1) == valid_codes.unsqueeze(0))
+
+            # Step 2: Convert to mismatches (1 if different, 0 if same)
+            mismatches = (~matches).float()  # (B, N, 4)
+
+            # Step 3: Apply hierarchical weights
+            # L0 (coarse category) = 8, L1 (subcategory) = 4,
+            # L2 (details) = 2, Dedup (collision ID) = 1
+            weights = torch.tensor([8.0, 4.0, 2.0, 1.0], device=device)
+
+            # Step 4: Compute weighted distance
+            # (B, N, 4) * (4,) -> (B, N, 4) -> sum -> (B, N)
+            distances = (mismatches * weights).sum(dim=2)
+
+            # Perfect match = 0, all layers wrong = 15 (8+4+2+1)
+
+        else:
+            # ============================================================
+            # L1 Distance (LEGACY - NOT RECOMMENDED)
+            # ============================================================
+            # Treats codes as continuous numbers (incorrect assumption!)
+            distances = torch.abs(codes_batch.unsqueeze(1) - valid_codes.unsqueeze(0)).sum(dim=2)
+
+        # Find nearest neighbor for each query
+        nearest_indices = torch.argmin(distances, dim=1)  # (B,)
+
+        # Return corresponding item IDs
+        return item_ids[nearest_indices]
 
     def get_layer_range(self, layer_idx):
         return self.layer_ranges[layer_idx]
