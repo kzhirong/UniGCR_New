@@ -53,7 +53,7 @@ class UniGCRConfig:
     hstu_enable_rel_bias: bool = True          # Enable relative attention bias
     
     # --- [训练参数] ---
-    patience: int = 3
+    patience: int = 15  # Increased to allow scheduled sampling to take effect (epochs 6-15)
     batch_size: int = 64
     lr: float = 1e-3
     epochs: int = 50

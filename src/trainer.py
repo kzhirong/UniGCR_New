@@ -100,9 +100,27 @@ class UniGCRTrainer:
         """
         self.model.train()
 
+        # Scheduled Sampling: Gradually reduce teacher forcing ratio
+        # Epochs 1-5: Full teacher forcing (1.0)
+        # Epochs 6-15: Linear decay (1.0 → 0.3)
+        # Epochs 16+: Partial teacher forcing (0.3)
+        if epoch_idx <= 5:
+            teacher_forcing_ratio = 1.0
+        elif epoch_idx <= 15:
+            # Linear decay from 1.0 to 0.3 over epochs 6-15
+            teacher_forcing_ratio = 1.0 - 0.7 * (epoch_idx - 5) / 10
+        else:
+            teacher_forcing_ratio = 0.3
+
+        # Set the ratio on the model
+        self.model.teacher_forcing_ratio = teacher_forcing_ratio
+
+        if is_main_process():
+            print(f"[Epoch {epoch_idx}] Teacher forcing ratio: {teacher_forcing_ratio:.2f}")
+
         # 仅主进程显示进度条
         if is_main_process():
-            pbar = tqdm(self.train_loader, desc=f"Epoch {epoch_idx}")
+            pbar = tqdm(self.train_loader, desc=f"Epoch {epoch_idx} (TF={teacher_forcing_ratio:.2f})")
         else:
             pbar = self.train_loader
 

@@ -233,10 +233,14 @@ class UniGCRModel(nn.Module):
 
             # Autoregressive prediction for this position
             # Returns: [(B, 256), (B, 256), (B, 256), (B, 19)]
+            # Get teacher forcing ratio (default 1.0 for full teacher forcing)
+            teacher_forcing_ratio = getattr(self, 'teacher_forcing_ratio', 1.0)
+
             logits_list, _ = self.predict_codes_autoregressive(
                 u_pos,
                 target_codes=target_codes_pos,
-                training=self.training
+                training=self.training,
+                teacher_forcing_ratio=teacher_forcing_ratio
             )
 
             # Collect logits for each layer
@@ -254,7 +258,7 @@ class UniGCRModel(nn.Module):
 
         return u, logits_seq, None  # candidate_embeddings not used in Research HSTU
 
-    def predict_codes_autoregressive(self, u, target_codes=None, training=True):
+    def predict_codes_autoregressive(self, u, target_codes=None, training=True, teacher_forcing_ratio=1.0):
         """
         Autoregressive prediction of 4-layer semantic codes.
         Each layer is predicted conditioned on previous layers.
@@ -264,6 +268,9 @@ class UniGCRModel(nn.Module):
             target_codes: (B, 4) ground truth RAW codes (for teacher forcing during training)
                          Codes are WITHOUT offsets: [0-255, 0-255, 0-255, 0-18]
             training: If True, use teacher forcing; else use greedy sampling
+            teacher_forcing_ratio: Probability of using ground truth vs model prediction (0.0-1.0)
+                                   1.0 = always use ground truth (full teacher forcing)
+                                   0.0 = always use model predictions (no teacher forcing)
 
         Returns:
             logits_list: List of 4 tensors [(B, 256), (B, 256), (B, 256), (B, 19)]
@@ -279,11 +286,16 @@ class UniGCRModel(nn.Module):
         logits_L0 = self.gr_head_L0(context)  # (B, 256)
         logits_list.append(logits_L0)
 
-        # Get code for L0 (teacher forcing or greedy)
+        # Get code for L0 (scheduled sampling: mix of teacher forcing and model predictions)
         if training and target_codes is not None:
-            code_L0 = target_codes[:, 0]  # Teacher forcing: use ground truth
+            # Scheduled sampling: randomly choose between ground truth and prediction
+            use_teacher_forcing = torch.rand(1).item() < teacher_forcing_ratio
+            if use_teacher_forcing:
+                code_L0 = target_codes[:, 0]  # Teacher forcing: use ground truth
+            else:
+                code_L0 = torch.argmax(logits_L0, dim=1)  # Use model prediction
         else:
-            code_L0 = torch.argmax(logits_L0, dim=1)  # Greedy sampling
+            code_L0 = torch.argmax(logits_L0, dim=1)  # Greedy sampling at inference
         sampled_codes.append(code_L0)
 
         # ============================================================
@@ -299,8 +311,13 @@ class UniGCRModel(nn.Module):
         logits_L1 = self.gr_head_L1(context)  # (B, 256)
         logits_list.append(logits_L1)
 
+        # Scheduled sampling for L1
         if training and target_codes is not None:
-            code_L1 = target_codes[:, 1]
+            use_teacher_forcing = torch.rand(1).item() < teacher_forcing_ratio
+            if use_teacher_forcing:
+                code_L1 = target_codes[:, 1]
+            else:
+                code_L1 = torch.argmax(logits_L1, dim=1)
         else:
             code_L1 = torch.argmax(logits_L1, dim=1)
         sampled_codes.append(code_L1)
@@ -317,8 +334,13 @@ class UniGCRModel(nn.Module):
         logits_L2 = self.gr_head_L2(context)  # (B, 256)
         logits_list.append(logits_L2)
 
+        # Scheduled sampling for L2
         if training and target_codes is not None:
-            code_L2 = target_codes[:, 2]
+            use_teacher_forcing = torch.rand(1).item() < teacher_forcing_ratio
+            if use_teacher_forcing:
+                code_L2 = target_codes[:, 2]
+            else:
+                code_L2 = torch.argmax(logits_L2, dim=1)
         else:
             code_L2 = torch.argmax(logits_L2, dim=1)
         sampled_codes.append(code_L2)
@@ -335,8 +357,13 @@ class UniGCRModel(nn.Module):
         logits_Dedup = self.gr_head_Dedup(context)  # (B, 19)
         logits_list.append(logits_Dedup)
 
+        # Scheduled sampling for Dedup
         if training and target_codes is not None:
-            code_Dedup = target_codes[:, 3]
+            use_teacher_forcing = torch.rand(1).item() < teacher_forcing_ratio
+            if use_teacher_forcing:
+                code_Dedup = target_codes[:, 3]
+            else:
+                code_Dedup = torch.argmax(logits_Dedup, dim=1)
         else:
             code_Dedup = torch.argmax(logits_Dedup, dim=1)
         sampled_codes.append(code_Dedup)
