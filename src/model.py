@@ -404,12 +404,35 @@ class UniGCRModel(nn.Module):
 
         # Convert each semantic code sequence to item ID
         item_indices = []
+        debug_printed = False
         for i in range(codes_flat.size(0)):
-            codes = codes_flat[i].cpu().tolist()
+            codes_raw = codes_flat[i].cpu().tolist()  # RAW codes: [0-255, 0-255, 0-255, 0-18]
 
             # Use grid_mapper to reverse lookup: semantic_codes -> item_id
             if grid_mapper:
-                item_id = grid_mapper.codes_to_item(codes)
+                # IMPORTANT: grid_mapper.codes_to_item() expects OFFSET codes!
+                # Apply offsets: [L0+1, L1+257, L2+513, Dedup+769]
+                codes_offset = grid_mapper._apply_offset(codes_raw)
+
+                # Use nearest neighbor fallback for invalid code combinations
+                # (Model predicts layers independently, so not all combinations are valid)
+                item_id = grid_mapper.codes_to_item_nearest(codes_offset)
+
+                # DEBUG: Print first 3 lookups to diagnose the issue
+                if not debug_printed and i < 3:
+                    print(f"\n[DEBUG] Lookup #{i}:")
+                    print(f"  codes_raw: {codes_raw}")
+                    print(f"  codes_offset: {codes_offset}")
+                    print(f"  item_id result: {item_id} (nearest neighbor)")
+                    if i == 0:
+                        # Print sample of reverse_mapping keys
+                        sample_keys = list(grid_mapper.reverse_mapping.keys())[:5]
+                        print(f"  Sample reverse_mapping keys: {sample_keys}")
+                        print(f"  Total keys in reverse_mapping: {len(grid_mapper.reverse_mapping)}")
+                        print(f"  [Note] Model predicts layers independently → most predictions need NN mapping")
+                    if i == 2:
+                        debug_printed = True
+
                 # If code doesn't map to any item (shouldn't happen), use 0
                 item_indices.append(item_id if item_id is not None else 0)
             else:

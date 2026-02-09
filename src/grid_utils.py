@@ -126,6 +126,43 @@ class GridMapper:
 
     def codes_to_item(self, code_tuple):
         return self.reverse_mapping.get(tuple(code_tuple), None)
-        
+
+    def codes_to_item_nearest(self, code_tuple):
+        """
+        Find item ID for code_tuple, with fallback to nearest neighbor if exact match fails.
+
+        Args:
+            code_tuple: Tuple or list of offset codes [L0+offset, L1+offset, L2+offset, Dedup+offset]
+
+        Returns:
+            item_id: Item ID (int), or None if mapping is empty
+        """
+        # Try exact match first
+        code_tuple = tuple(code_tuple)
+        exact_match = self.reverse_mapping.get(code_tuple, None)
+        if exact_match is not None:
+            return exact_match
+
+        # Fallback: Find nearest neighbor using L1 distance
+        if not self.reverse_mapping:
+            return None
+
+        min_dist = float('inf')
+        best_item = None
+
+        # Convert query to tensor for faster computation
+        query = torch.tensor(code_tuple, dtype=torch.long)
+
+        # Search for nearest valid code (L1 distance)
+        for valid_codes, item_id in self.reverse_mapping.items():
+            valid_tensor = torch.tensor(valid_codes, dtype=torch.long)
+            dist = torch.abs(query - valid_tensor).sum().item()
+
+            if dist < min_dist:
+                min_dist = dist
+                best_item = item_id
+
+        return best_item
+
     def get_layer_range(self, layer_idx):
         return self.layer_ranges[layer_idx]

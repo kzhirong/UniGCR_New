@@ -337,34 +337,50 @@ class UniGCRTrainer:
                 all_ctr_labels.append(ctr_labels.view(-1))
 
             # --- B. 计算 GR Ranking Metrics (Hit/NDCG) ---
-            # Use Independent Top-K beam search for parallel prediction
+            # Use rank-matched beam search for parallel prediction
             # Generate top-k candidates using the new beam search implementation
             candidates = self.model.generate_gr_candidates(
                 batch, k=topk, grid_mapper=grid_mapper
             )
 
-            # Debug: check first batch candidates
+            # DEBUG: Check candidates on first batch
             if is_main_process() and all_gr_count == 0:
-                print(f"[DEBUG] Candidates shape: {candidates.shape}")
-                print(f"[DEBUG] First user candidates: {candidates[0].tolist()}")
-                print(f"[DEBUG] Unique candidates: {torch.unique(candidates).size(0)}")
+                print(f"\n[DEBUG] After offset fix:")
+                print(f"  Candidates shape: {candidates.shape}")
+                print(f"  First 3 users, first 5 candidates each:")
+                for i in range(min(3, candidates.size(0))):
+                    print(f"    User {i}: {candidates[i, :5].tolist()}")
+                print(f"  Unique candidates: {torch.unique(candidates).size(0)}")
+                print(f"  Min/Max: {candidates.min().item()}/{candidates.max().item()}")
 
             # Compute Hit@k and NDCG@k
             # sem_target_eval: (B,) - ground truth item indices
             # candidates: (B, k) - predicted item IDs
             target_item_ids = batch.get('sem_target_eval', None)
 
+            # DEBUG: Check targets on first batch
+            if is_main_process() and all_gr_count == 0:
+                if target_item_ids is not None:
+                    print(f"\n[DEBUG] Targets:")
+                    print(f"  Target shape: {target_item_ids.shape}")
+                    print(f"  First 5 targets: {target_item_ids[:5].tolist()}")
+                else:
+                    print(f"\n[DEBUG] target_item_ids is None! Batch keys: {batch.keys()}")
+
             if target_item_ids is not None:
                 batch_hit, batch_ndcg = compute_gr_metrics(
                     candidates, target_item_ids, k=topk
                 )
+
+                # DEBUG: Check metrics on first batch
+                if is_main_process() and all_gr_count == 0:
+                    print(f"\n[DEBUG] Metrics:")
+                    print(f"  batch_hit: {batch_hit}")
+                    print(f"  batch_ndcg: {batch_ndcg}")
+
                 all_hit_sums += batch_hit * target_item_ids.size(0)
                 all_ndcg_sums += batch_ndcg * target_item_ids.size(0)
                 all_gr_count += target_item_ids.size(0)
-            else:
-                # Debug: check why sem_target_eval is missing
-                if is_main_process() and all_gr_count == 0:
-                    print(f"[DEBUG] sem_target_eval not found in batch. Keys: {batch.keys()}")
 
         # --- 汇总结果 ---
         num_batches = len(self.val_loader)
