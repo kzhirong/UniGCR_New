@@ -264,7 +264,10 @@ class UniGCRTrainer:
         all_ctr_logits = []
         all_ctr_labels = []
 
-        # Note: Hit/NDCG metrics disabled until beam search is fixed for parallel prediction
+        # GR Ranking Metrics (Hit/NDCG)
+        all_hit_sums = 0.0
+        all_ndcg_sums = 0.0
+        all_gr_count = 0
 
         iterator = tqdm(self.val_loader, desc="Eval") if is_main_process() else self.val_loader
 
@@ -334,25 +337,24 @@ class UniGCRTrainer:
                 all_ctr_labels.append(ctr_labels.view(-1))
 
             # --- B. 计算 GR Ranking Metrics (Hit/NDCG) ---
-            # TEMPORARILY DISABLED: Beam search is broken for parallel prediction architecture
-            # The _beam_search_hard_negatives method assumes sequential layer prediction
-            # but our architecture predicts all 4 layers in parallel.
-            # TODO: Fix beam search for Research HSTU + parallel prediction
-            # For Phase 1 (GR-only training), loss-based evaluation is sufficient for early stopping.
+            # Use Independent Top-K beam search for parallel prediction
+            # Generate top-k candidates using the new beam search implementation
+            candidates = self.model.generate_gr_candidates(
+                batch, k=topk, grid_mapper=grid_mapper
+            )
 
-            # Commenting out beam search evaluation:
-            # candidates = self.model.generate_gr_candidates(
-            #     batch, k=topk, grid_mapper=grid_mapper
-            # )
-            # batch_hit, batch_ndcg = compute_gr_metrics(
-            #     candidates, batch['sem_target_eval'], k=topk
-            # )
-            # all_hit_sums += batch_hit * batch['sem_target_eval'].size(0)
-            # all_ndcg_sums += batch_ndcg * batch['sem_target_eval'].size(0)
-            # all_gr_count += batch['sem_target_eval'].size(0)
+            # Compute Hit@k and NDCG@k
+            # sem_target_eval: (B,) - ground truth item indices
+            # candidates: (B, k) - predicted item IDs
+            target_item_ids = batch.get('sem_target_eval', None)
 
-            # Set dummy values to avoid breaking the code below
-            pass
+            if target_item_ids is not None:
+                batch_hit, batch_ndcg = compute_gr_metrics(
+                    candidates, target_item_ids, k=topk
+                )
+                all_hit_sums += batch_hit * target_item_ids.size(0)
+                all_ndcg_sums += batch_ndcg * target_item_ids.size(0)
+                all_gr_count += target_item_ids.size(0)
 
         # --- 汇总结果 ---
         num_batches = len(self.val_loader)
@@ -362,13 +364,19 @@ class UniGCRTrainer:
         avg_gr_loss = val_gr_loss_sum / num_batches
         avg_ctr_loss = val_ctr_loss_sum / num_batches
 
-        # 2. GR Metrics 汇总 (DISABLED - Beam search not working)
-        # Since beam search is disabled, we skip Hit/NDCG metrics for now
-        # These metrics will show 0.0 until beam search is fixed
+        # 2. GR Metrics 汇总
+        # Compute average Hit@k and NDCG@k across all validation samples
+        if all_gr_count > 0:
+            avg_hit = all_hit_sums / all_gr_count
+            avg_ndcg = all_ndcg_sums / all_gr_count
+        else:
+            avg_hit = 0.0
+            avg_ndcg = 0.0
+
         results = {
             'val_gr_loss': avg_gr_loss,
-            'Hit@10': 0.0,  # Disabled - beam search broken
-            'NDCG@10': 0.0,  # Disabled - beam search broken
+            'Hit@10': avg_hit,
+            'NDCG@10': avg_ndcg,
         }
 
         # 3. CTR Metrics 汇总 (Gather & Sklearn)

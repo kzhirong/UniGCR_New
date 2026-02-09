@@ -247,125 +247,102 @@ class UniGCRModel(nn.Module):
     @torch.no_grad()
     def _beam_search_hard_negatives(self, batch_dict, u_current, beam_width=5, grid_mapper=None):
         """
-        在 Training 中使用 Beam Search 生成 Hard Negatives。
-        这需要多次运行 Backbone，比较耗时，但质量高。
+        Independent Top-K beam search for parallel 4-layer prediction.
+
+        For each semantic layer, independently select top-k predictions,
+        then combine and rank all k^4 possible combinations.
+
+        This is designed for our parallel prediction architecture where all
+        4 layers (L0, L1, L2, Dedup) are predicted simultaneously, not sequentially.
+
+        Args:
+            batch_dict: Input batch dict (not used in this version, kept for API compatibility)
+            u_current: User state from forward pass (B, D)
+            beam_width: Number of candidates to return (k)
+            grid_mapper: GridMapper instance (not used in this version, kept for API compatibility)
+
+        Returns:
+            beam_results: (B, k, num_layers) tensor of semantic codes (RAW codes, not offset)
         """
         B = u_current.size(0)
         device = u_current.device
-        num_layers = self.config.sem_id_layers
-        
-        # 准备 Beam Search 的初始输入
-        # 我们需要复制 batch_dict 中的所有 Tensor 到 (B*K)
-        # 但为了节省显存，我们只扩展必要的 sem_history
-        
-        # 初始 Input: 原始的 sem_history
-        # (B, T)
-        curr_seqs = batch_dict['sem_history'] 
-        
-        # 初始 Scores: (B*K)
-        # 第一步只有 1 个 Beam (原始序列)
-        curr_scores = torch.zeros(B, device=device) 
-        
-        # 扩展其他特征以备后续使用 (Profile, Atomic)
-        # 这里的策略是：InputLayer 处理时支持广播，或者我们将 Profile 重复 K 次
-        # 为了实现简单，我们将 batch_dict 里的 tensor 全部 repeat
-        expanded_batch = {}
-        for k, v in batch_dict.items():
-            if isinstance(v, torch.Tensor):
-                # 如果是 (B, ...)，重复成 (B*K, ...)
-                # 初始 K=1, 后续 K=beam_width
-                expanded_batch[k] = v # 初始不重复
-        
-        # 开始逐层生成
-        # layer_idx: 0 -> 1 -> 2
-        for layer_idx in range(num_layers):
-            # 1. 构造当前步的 Input Embedding
-            # expanded_batch['sem_history'] = curr_seqs
-            # 注意：这里的 curr_seqs 长度在不断增加
-            
-            # 调用 Backbone
-            # x: (Current_Batch, Len, D)
-            x = self.input_layer(expanded_batch)
-            B_curr, L, _ = x.shape
-            lengths = torch.full((B_curr,), L, dtype=torch.long, device=device)
-            u_seq = self.backbone(x, lengths=lengths)
-            u_next = u_seq[:, -1, :] # 取最后一个 token 预测下一步
-            
-            logits = self.gr_head(u_next) # (B_curr, Vocab)
-            log_probs = torch.log_softmax(logits, dim=-1)
-            
-            # Masking (只允许当前 Layer 的 ID)
-            if grid_mapper:
-                start, end = grid_mapper.get_layer_range(layer_idx)
-                mask = torch.ones_like(logits) * float('-inf')
-                mask[:, start:end] = 0
-                log_probs = log_probs + mask
-            
-            # Beam Expansion
-            # curr_scores: (B_curr) -> (B_curr, 1)
-            # log_probs: (B_curr, Vocab)
-            # scores: (B_curr, Vocab)
-            next_scores = curr_scores.unsqueeze(1) + log_probs
-            
-            if layer_idx == 0:
-                # 第一层：从 1 扩展到 K
-                # topk: (B, K)
-                topk_scores, topk_ids = torch.topk(next_scores, beam_width, dim=1)
-                
-                # 更新状态到 B*K
-                curr_scores = topk_scores.view(-1) # (B*K)
-                
-                # 扩展 History: (B, T) -> (B, K, T) -> (B*K, T)
-                seq_exp = curr_seqs.unsqueeze(1).repeat(1, beam_width, 1).view(B*beam_width, -1)
-                new_tokens = topk_ids.view(-1, 1)
-                curr_seqs = torch.cat([seq_exp, new_tokens], dim=1)
-                
-                # 扩展 Batch Dict 中的其他特征
-                for k, v in batch_dict.items():
-                    if isinstance(v, torch.Tensor):
-                        # (B, ...) -> (B, K, ...) -> (B*K, ...)
-                        shape = [B, beam_width] + list(v.shape[1:])
-                        expanded_batch[k] = v.unsqueeze(1).repeat(1, beam_width, *([1]*(v.dim()-1))).view(-1, *v.shape[1:])
-                # 更新 sem_history 指针
-                expanded_batch['sem_history'] = curr_seqs
-                
-            else:
-                # 后续层：从 B*K 扩展到 B*K*Vocab，取 Top K
-                # next_scores: (B*K, Vocab) -> view (B, K, Vocab)
-                vocab_size = logits.size(-1)
-                next_scores = next_scores.view(B, beam_width, vocab_size).view(B, -1)
-                
-                # TopK per user
-                best_scores, best_indices = torch.topk(next_scores, beam_width, dim=1) # (B, K)
-                
-                # 解码 Index
-                beam_indices = best_indices // vocab_size # 属于哪个旧 beam
-                token_indices = best_indices % vocab_size # 新 token 是什么
-                
-                # Gather Seqs
-                # curr_seqs: (B*K, T) -> (B, K, T)
-                curr_seqs_view = curr_seqs.view(B, beam_width, -1)
-                
-                new_seq_list = []
-                for b in range(B):
-                    # select beams
-                    sel_beams = curr_seqs_view[b][beam_indices[b]] # (K, T)
-                    sel_tokens = token_indices[b].unsqueeze(1)     # (K, 1)
-                    new_seq_list.append(torch.cat([sel_beams, sel_tokens], dim=1))
-                
-                curr_seqs = torch.cat(new_seq_list, dim=0) # (B*K, T+1)
-                curr_scores = best_scores.view(-1)
-                
-                # 更新 sem_history
-                expanded_batch['sem_history'] = curr_seqs
-        
-        # Loop 结束
-        # curr_seqs 是 (B*K, T_orig + Layers)
-        # 我们只需要最后生成的 Layers 部分
-        generated = curr_seqs[:, -num_layers:] # (B*K, Layers)
-        generated = generated.view(B, beam_width, num_layers)
-        
-        return generated
+        num_layers = self.config.sem_id_layers  # Should be 4
+
+        # 1. Get predictions for next item from all 4 GR heads
+        # These are the logits for predicting the NEXT item
+        logits_L0 = self.gr_head_L0(u_current)        # (B, 256)
+        logits_L1 = self.gr_head_L1(u_current)        # (B, 256)
+        logits_L2 = self.gr_head_L2(u_current)        # (B, 256)
+        logits_Dedup = self.gr_head_Dedup(u_current)  # (B, 19)
+
+        all_logits = [logits_L0, logits_L1, logits_L2, logits_Dedup]
+
+        # 2. For each layer, get top-k predictions and their log probabilities
+        layer_topk_codes = []       # List of (B, k) tensors
+        layer_topk_logprobs = []    # List of (B, k) tensors
+
+        for layer_idx, logits in enumerate(all_logits):
+            log_probs = torch.log_softmax(logits, dim=-1)  # (B, vocab_size)
+
+            # Get top-k for this layer
+            topk_logprobs, topk_codes = torch.topk(log_probs, beam_width, dim=-1)
+            # topk_logprobs: (B, k)
+            # topk_codes: (B, k) - RAW codes (0-255 for L0/L1/L2, 0-18 for Dedup)
+
+            layer_topk_codes.append(topk_codes)
+            layer_topk_logprobs.append(topk_logprobs)
+
+        # 3. Generate all k^4 combinations and score them
+        # For efficiency, we'll process each user in the batch
+        batch_results = []
+
+        for b in range(B):
+            # Get top-k codes and logprobs for this user
+            codes_L0 = layer_topk_codes[0][b]       # (k,)
+            codes_L1 = layer_topk_codes[1][b]       # (k,)
+            codes_L2 = layer_topk_codes[2][b]       # (k,)
+            codes_Dedup = layer_topk_codes[3][b]    # (k,)
+
+            logprobs_L0 = layer_topk_logprobs[0][b]     # (k,)
+            logprobs_L1 = layer_topk_logprobs[1][b]     # (k,)
+            logprobs_L2 = layer_topk_logprobs[2][b]     # (k,)
+            logprobs_Dedup = layer_topk_logprobs[3][b]  # (k,)
+
+            # Generate all k^4 combinations
+            # For k=10, this is 10,000 combinations (manageable)
+            combinations = []
+            scores = []
+
+            for i0 in range(beam_width):
+                for i1 in range(beam_width):
+                    for i2 in range(beam_width):
+                        for i3 in range(beam_width):
+                            # Combination of codes
+                            combo = [
+                                codes_L0[i0].item(),
+                                codes_L1[i1].item(),
+                                codes_L2[i2].item(),
+                                codes_Dedup[i3].item()
+                            ]
+                            combinations.append(combo)
+
+                            # Score = sum of log probabilities
+                            score = (logprobs_L0[i0] + logprobs_L1[i1] +
+                                   logprobs_L2[i2] + logprobs_Dedup[i3])
+                            scores.append(score.item())
+
+            # Sort by score (descending) and keep top-k
+            scores_tensor = torch.tensor(scores, device=device)
+            topk_scores, topk_indices = torch.topk(scores_tensor, beam_width)
+
+            # Get top-k combinations
+            topk_combos = [combinations[idx] for idx in topk_indices.cpu().tolist()]
+            batch_results.append(topk_combos)
+
+        # 4. Convert to tensor: (B, k, num_layers)
+        beam_results = torch.tensor(batch_results, dtype=torch.long, device=device)
+
+        return beam_results
 
     def predict_ctr(self, u, batch_dict, pos_codes, device, grid_mapper):
         """
