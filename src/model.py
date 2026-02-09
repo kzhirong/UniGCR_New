@@ -290,7 +290,9 @@ class UniGCRModel(nn.Module):
         # Layer 1: Predict L1 conditioned on L0
         # ============================================================
         # Embed L0 code and combine with user state
-        emb_L0 = self.input_layer.sem_emb_layers[0](code_L0)  # (B, D)
+        # IMPORTANT: Clamp code to valid range before embedding (handle -100 padding)
+        code_L0_for_embed = torch.clamp(code_L0, min=0, max=255)
+        emb_L0 = self.input_layer.sem_emb_layers[0](code_L0_for_embed)  # (B, D)
         context = torch.cat([u, emb_L0], dim=1)  # (B, 2D)
         context = self.autoregressive_combiner_L1(context)  # (B, D) - project back
 
@@ -306,7 +308,9 @@ class UniGCRModel(nn.Module):
         # ============================================================
         # Layer 2: Predict L2 conditioned on L0, L1
         # ============================================================
-        emb_L1 = self.input_layer.sem_emb_layers[1](code_L1)  # (B, D)
+        # IMPORTANT: Clamp code to valid range before embedding (handle -100 padding)
+        code_L1_for_embed = torch.clamp(code_L1, min=0, max=255)
+        emb_L1 = self.input_layer.sem_emb_layers[1](code_L1_for_embed)  # (B, D)
         context = torch.cat([u, emb_L0, emb_L1], dim=1)  # (B, 3D)
         context = self.autoregressive_combiner_L2(context)  # (B, D)
 
@@ -322,7 +326,9 @@ class UniGCRModel(nn.Module):
         # ============================================================
         # Layer 3: Predict Dedup conditioned on L0, L1, L2
         # ============================================================
-        emb_L2 = self.input_layer.sem_emb_layers[2](code_L2)  # (B, D)
+        # IMPORTANT: Clamp code to valid range before embedding (handle -100 padding)
+        code_L2_for_embed = torch.clamp(code_L2, min=0, max=255)
+        emb_L2 = self.input_layer.sem_emb_layers[2](code_L2_for_embed)  # (B, D)
         context = torch.cat([u, emb_L0, emb_L1, emb_L2], dim=1)  # (B, 4D)
         context = self.autoregressive_combiner_Dedup(context)  # (B, D)
 

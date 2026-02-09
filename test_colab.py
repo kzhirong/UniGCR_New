@@ -72,17 +72,42 @@ try:
              for k, v in batch.items()}
 
     print(f"   sem_history: {batch['sem_history'].shape}")
-    if 'target_codes_seq' in batch:
+
+    # Prepare target_codes_seq manually (trainer will do this during training)
+    if 'sem_target' in batch and 'target_codes_seq' not in batch:
+        sem_target = batch['sem_target']
+        B = sem_target.size(0)
+
+        # Reshape if flattened
+        if sem_target.dim() == 2 and sem_target.size(1) % conf.sem_id_layers == 0:
+            num_items = sem_target.size(1) // conf.sem_id_layers
+            sem_target = sem_target.view(B, num_items, conf.sem_id_layers)
+
+        # Remove offsets to get RAW codes
+        layer_offsets = torch.tensor([1, 257, 513, 769], device=sem_target.device)
+        target_codes_seq = sem_target - layer_offsets.view(1, 1, -1)
+
+        # Handle padding: mask out padding tokens (0 becomes -1 after offset removal)
+        # Replace negative values with -100 (ignore_index for cross_entropy)
+        target_codes_seq = torch.where(
+            target_codes_seq < 0,
+            torch.tensor(-100, device=target_codes_seq.device),
+            target_codes_seq
+        )
+
+        batch['target_codes_seq'] = target_codes_seq
+        print(f"   target_codes_seq: {batch['target_codes_seq'].shape} (prepared for test)")
+    elif 'target_codes_seq' in batch:
         print(f"   target_codes_seq: {batch['target_codes_seq'].shape}")
 
     # Forward pass
     with torch.no_grad():
-        output = model(batch)
+        u, logits_seq, _ = model(batch)
 
     print(f"✅ Forward pass successful!")
 
     # Check outputs
-    logits_seq = output['logits_seq']
+    print(f"   User representation: {u.shape}")
     print(f"   Output: {len(logits_seq)} layer logits")
     for i, logits in enumerate(logits_seq):
         vocab_size = 256 if i < 3 else 19
@@ -140,23 +165,142 @@ try:
     batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
              for k, v in batch.items()}
 
+    # IMPORTANT: Truncate sequences to reduce memory usage for testing
+    # Autoregressive training is memory-intensive (loops through all positions)
+    MAX_ITEMS_TEST = 5  # Only use first 5 items for testing
+
+    # Truncate sem_history
+    if 'sem_history' in batch:
+        original_shape = batch['sem_history'].shape
+        batch['sem_history'] = batch['sem_history'][:, :MAX_ITEMS_TEST * conf.sem_id_layers]
+        print(f"   Truncated sem_history: {original_shape} -> {batch['sem_history'].shape}")
+
+    # Truncate sem_target
+    if 'sem_target' in batch:
+        batch['sem_target'] = batch['sem_target'][:, :MAX_ITEMS_TEST * conf.sem_id_layers]
+
+    # Update lengths
+    batch['lengths'] = torch.full((batch['sem_history'].size(0),),
+                                   MAX_ITEMS_TEST * conf.sem_id_layers,
+                                   dtype=torch.long, device=device)
+
+    # Prepare target_codes_seq (same as above)
+    if 'sem_target' in batch and 'target_codes_seq' not in batch:
+        sem_target = batch['sem_target']
+        B = sem_target.size(0)
+        if sem_target.dim() == 2 and sem_target.size(1) % conf.sem_id_layers == 0:
+            num_items = sem_target.size(1) // conf.sem_id_layers
+            sem_target = sem_target.view(B, num_items, conf.sem_id_layers)
+
+        # Remove offsets to get RAW codes
+        layer_offsets = torch.tensor([1, 257, 513, 769], device=sem_target.device)
+        target_codes_seq = sem_target - layer_offsets.view(1, 1, -1)
+
+        # Handle padding: mask out padding tokens (0 becomes -1 after offset removal)
+        # Replace negative values with -100 (ignore_index for cross_entropy)
+        target_codes_seq = torch.where(
+            target_codes_seq < 0,
+            torch.tensor(-100, device=target_codes_seq.device),
+            target_codes_seq
+        )
+
+        batch['target_codes_seq'] = target_codes_seq
+        print(f"   target_codes_seq: {target_codes_seq.shape}")
+
+        # Debug: Check for any remaining invalid values
+        for layer_idx in range(4):
+            layer_targets = target_codes_seq[:, :, layer_idx]
+            valid_targets = layer_targets[layer_targets >= 0]  # Exclude -100
+            if len(valid_targets) > 0:
+                min_val = valid_targets.min().item()
+                max_val = valid_targets.max().item()
+                expected_max = 255 if layer_idx < 3 else 18
+                print(f"   Layer {layer_idx} targets: range=[{min_val}, {max_val}] (expected: [0, {expected_max}])")
+
+                if max_val > expected_max:
+                    print(f"   ⚠️ WARNING: Layer {layer_idx} has targets > {expected_max}!")
+                    # Clamp to valid range
+                    target_codes_seq[:, :, layer_idx] = torch.clamp(
+                        target_codes_seq[:, :, layer_idx],
+                        min=-100,
+                        max=expected_max
+                    )
+
     # Forward
-    output = model(batch)
-    logits_seq = output['logits_seq']
+    print(f"   Running forward pass (this may take a moment)...")
+    u, logits_seq, _ = model(batch)
+    print(f"   Forward completed!")
 
     # Compute loss (simplified - just check it runs)
     if 'target_codes_seq' in batch:
         target_codes = batch['target_codes_seq']
         losses = []
 
+        # DEBUG: Check logits and targets before computing loss
+        print(f"\n   === DEBUGGING LOGITS vs TARGETS ===")
         for layer_idx, logits in enumerate(logits_seq):
             target = target_codes[:, :, layer_idx]
+
+            expected_vocab = 256 if layer_idx < 3 else 19
+            actual_vocab = logits.size(-1)
+
+            print(f"   Layer {layer_idx}:")
+            print(f"      Logits shape: {logits.shape} (vocab={actual_vocab}, expected={expected_vocab})")
+            print(f"      Targets shape: {target.shape}")
+
+            # Check for NaN/Inf in logits
+            has_nan = torch.isnan(logits).any().item()
+            has_inf = torch.isinf(logits).any().item()
+            print(f"      Logits: NaN={has_nan}, Inf={has_inf}")
+
+            # Check target dtype
+            print(f"      Targets dtype: {target.dtype}")
+
+            # Check target statistics
+            valid_targets = target[target >= 0]  # Exclude -100 padding
+            if len(valid_targets) > 0:
+                min_t = valid_targets.min().item()
+                max_t = valid_targets.max().item()
+                print(f"      Targets (valid): min={min_t}, max={max_t}, count={len(valid_targets)}")
+
+                # Check if any target exceeds vocab size
+                if max_t >= actual_vocab:
+                    print(f"      ❌ ERROR: Target {max_t} >= vocab size {actual_vocab}")
+
+            # Check for -100 padding
+            num_padding = (target == -100).sum().item()
+            print(f"      Padding tokens: {num_padding}")
+
+        print(f"   === END DEBUG ===\n")
+
+        # Now compute loss with additional safety checks
+        for layer_idx, logits in enumerate(logits_seq):
+            target = target_codes[:, :, layer_idx]
+
+            # Ensure target is long dtype (required for cross_entropy)
+            target = target.long()
+
+            # Safety: Clamp targets to valid range [0, vocab_size-1] or keep -100 for padding
+            vocab_size = logits.size(-1)
+            target = torch.where(
+                target == -100,
+                target,  # Keep -100 for padding
+                torch.clamp(target, 0, vocab_size - 1)  # Clamp valid targets
+            )
+
+            # Flatten
+            logits_flat = logits.reshape(-1, logits.size(-1))
+            target_flat = target.reshape(-1)
+
+            print(f"   Computing loss for layer {layer_idx}: logits={logits_flat.shape}, targets={target_flat.shape}, target_dtype={target_flat.dtype}")
+
             loss = torch.nn.functional.cross_entropy(
-                logits.reshape(-1, logits.size(-1)),
-                target.reshape(-1),
+                logits_flat,
+                target_flat,
                 ignore_index=-100
             )
             losses.append(loss)
+            print(f"      Loss: {loss.item():.4f}")
 
         total_loss = sum(losses)
         print(f"   Loss computed: {total_loss.item():.4f}")

@@ -143,6 +143,14 @@ class UniGCRTrainer:
                 layer_offsets = torch.tensor([1, 257, 513, 769], device=sem_target.device)
                 target_codes_seq = sem_target - layer_offsets.view(1, 1, -1)  # Broadcast and subtract
 
+                # Handle padding: mask out padding tokens (0 becomes -1 after offset removal)
+                # Replace negative values with -100 (ignore_index for cross_entropy)
+                target_codes_seq = torch.where(
+                    target_codes_seq < 0,
+                    torch.tensor(-100, device=target_codes_seq.device),
+                    target_codes_seq
+                )
+
                 # Add to batch for model access
                 batch['target_codes_seq'] = target_codes_seq
 
