@@ -343,6 +343,12 @@ class UniGCRTrainer:
                 batch, k=topk, grid_mapper=grid_mapper
             )
 
+            # Debug: check first batch candidates
+            if is_main_process() and all_gr_count == 0:
+                print(f"[DEBUG] Candidates shape: {candidates.shape}")
+                print(f"[DEBUG] First user candidates: {candidates[0].tolist()}")
+                print(f"[DEBUG] Unique candidates: {torch.unique(candidates).size(0)}")
+
             # Compute Hit@k and NDCG@k
             # sem_target_eval: (B,) - ground truth item indices
             # candidates: (B, k) - predicted item IDs
@@ -355,6 +361,10 @@ class UniGCRTrainer:
                 all_hit_sums += batch_hit * target_item_ids.size(0)
                 all_ndcg_sums += batch_ndcg * target_item_ids.size(0)
                 all_gr_count += target_item_ids.size(0)
+            else:
+                # Debug: check why sem_target_eval is missing
+                if is_main_process() and all_gr_count == 0:
+                    print(f"[DEBUG] sem_target_eval not found in batch. Keys: {batch.keys()}")
 
         # --- 汇总结果 ---
         num_batches = len(self.val_loader)

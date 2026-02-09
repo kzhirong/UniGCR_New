@@ -1,6 +1,12 @@
 """
 Test script for Independent Top-K beam search implementation
 """
+import sys
+import os
+
+# Add the parent directory to Python path to allow imports
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import torch
 from src.config import UniGCRConfig
 from src.model import UniGCRModel
@@ -19,11 +25,25 @@ def test_beam_search():
     config.max_seq_len = 153
     config.batch_size = 4  # Small batch for testing
 
+    # Set required paths - check which structure exists
+    if os.path.exists('data/train_sequences.json'):
+        config.data_path = 'data/train_sequences.json'
+        config.grid_mapping_path = 'data/semantic_id_kmean.pt'
+    elif os.path.exists('data/beauty/train_sequences.json'):
+        config.data_path = 'data/beauty/train_sequences.json'
+        config.grid_mapping_path = 'data/beauty/semantic_ids.json'
+    else:
+        raise FileNotFoundError("Cannot find data files. Please ensure data is in 'data/' or 'data/beauty/'")
+
+    config.use_semantic_seq = True
+
     print(f"\n[Config]")
     print(f"  Layers: {config.sem_id_layers}")
     print(f"  Codebook size (L0/L1/L2): {config.sem_id_codebook_size}")
     print(f"  Dedup size: {config.sem_id_dedup_size}")
     print(f"  Batch size: {config.batch_size}")
+    print(f"  Data path: {config.data_path}")
+    print(f"  Grid mapping: {config.grid_mapping_path}")
 
     # 2. Create model
     print(f"\n[Model]")
@@ -36,7 +56,7 @@ def test_beam_search():
 
     # 3. Load data
     print(f"\n[Data]")
-    train_loader, val_loader = get_dataloaders(config, args=None)
+    train_loader, val_loader = get_dataloaders(config)
     grid_mapper = val_loader.dataset.grid_mapper
     print(f"  Validation batches: {len(val_loader)}")
     print(f"  GridMapper items: {len(grid_mapper.mapping)}")

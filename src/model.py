@@ -247,13 +247,13 @@ class UniGCRModel(nn.Module):
     @torch.no_grad()
     def _beam_search_hard_negatives(self, batch_dict, u_current, beam_width=5, grid_mapper=None):
         """
-        Independent Top-K beam search for parallel 4-layer prediction.
+        Rank-Matched Top-K beam search for parallel 4-layer prediction.
 
         For each semantic layer, independently select top-k predictions,
-        then combine and rank all k^4 possible combinations.
+        then combine them by matching ranks (rank-1 with rank-1, rank-2 with rank-2, etc).
 
-        This is designed for our parallel prediction architecture where all
-        4 layers (L0, L1, L2, Dedup) are predicted simultaneously, not sequentially.
+        This is MUCH faster than full cartesian product (k combinations vs k^4).
+        Assumes layers are somewhat correlated (top codes tend to appear together).
 
         Args:
             batch_dict: Input batch dict (not used in this version, kept for API compatibility)
@@ -264,10 +264,6 @@ class UniGCRModel(nn.Module):
         Returns:
             beam_results: (B, k, num_layers) tensor of semantic codes (RAW codes, not offset)
         """
-        B = u_current.size(0)
-        device = u_current.device
-        num_layers = self.config.sem_id_layers  # Should be 4
-
         # 1. Get predictions for next item from all 4 GR heads
         # These are the logits for predicting the NEXT item
         logits_L0 = self.gr_head_L0(u_current)        # (B, 256)
@@ -277,70 +273,22 @@ class UniGCRModel(nn.Module):
 
         all_logits = [logits_L0, logits_L1, logits_L2, logits_Dedup]
 
-        # 2. For each layer, get top-k predictions and their log probabilities
-        layer_topk_codes = []       # List of (B, k) tensors
-        layer_topk_logprobs = []    # List of (B, k) tensors
+        # 2. For each layer, get top-k predictions (codes only, no log probs needed)
+        layer_topk_codes = []  # List of (B, k) tensors
 
         for layer_idx, logits in enumerate(all_logits):
-            log_probs = torch.log_softmax(logits, dim=-1)  # (B, vocab_size)
-
-            # Get top-k for this layer
-            topk_logprobs, topk_codes = torch.topk(log_probs, beam_width, dim=-1)
-            # topk_logprobs: (B, k)
+            # Get top-k codes for this layer
+            _, topk_codes = torch.topk(logits, beam_width, dim=-1)
             # topk_codes: (B, k) - RAW codes (0-255 for L0/L1/L2, 0-18 for Dedup)
-
             layer_topk_codes.append(topk_codes)
-            layer_topk_logprobs.append(topk_logprobs)
 
-        # 3. Generate all k^4 combinations and score them
-        # For efficiency, we'll process each user in the batch
-        batch_results = []
-
-        for b in range(B):
-            # Get top-k codes and logprobs for this user
-            codes_L0 = layer_topk_codes[0][b]       # (k,)
-            codes_L1 = layer_topk_codes[1][b]       # (k,)
-            codes_L2 = layer_topk_codes[2][b]       # (k,)
-            codes_Dedup = layer_topk_codes[3][b]    # (k,)
-
-            logprobs_L0 = layer_topk_logprobs[0][b]     # (k,)
-            logprobs_L1 = layer_topk_logprobs[1][b]     # (k,)
-            logprobs_L2 = layer_topk_logprobs[2][b]     # (k,)
-            logprobs_Dedup = layer_topk_logprobs[3][b]  # (k,)
-
-            # Generate all k^4 combinations
-            # For k=10, this is 10,000 combinations (manageable)
-            combinations = []
-            scores = []
-
-            for i0 in range(beam_width):
-                for i1 in range(beam_width):
-                    for i2 in range(beam_width):
-                        for i3 in range(beam_width):
-                            # Combination of codes
-                            combo = [
-                                codes_L0[i0].item(),
-                                codes_L1[i1].item(),
-                                codes_L2[i2].item(),
-                                codes_Dedup[i3].item()
-                            ]
-                            combinations.append(combo)
-
-                            # Score = sum of log probabilities
-                            score = (logprobs_L0[i0] + logprobs_L1[i1] +
-                                   logprobs_L2[i2] + logprobs_Dedup[i3])
-                            scores.append(score.item())
-
-            # Sort by score (descending) and keep top-k
-            scores_tensor = torch.tensor(scores, device=device)
-            topk_scores, topk_indices = torch.topk(scores_tensor, beam_width)
-
-            # Get top-k combinations
-            topk_combos = [combinations[idx] for idx in topk_indices.cpu().tolist()]
-            batch_results.append(topk_combos)
-
-        # 4. Convert to tensor: (B, k, num_layers)
-        beam_results = torch.tensor(batch_results, dtype=torch.long, device=device)
+        # 3. Rank-Matched Stacking
+        # Combine rank-1 from all layers, rank-2 from all layers, etc.
+        # Stack along last dimension to get (B, k, 4)
+        # pred_L0[:, 0] with pred_L1[:, 0] with pred_L2[:, 0] with pred_Dedup[:, 0] -> rank-1 combo
+        # pred_L0[:, 1] with pred_L1[:, 1] with pred_L2[:, 1] with pred_Dedup[:, 1] -> rank-2 combo
+        # ...
+        beam_results = torch.stack(layer_topk_codes, dim=-1)  # (B, k, 4)
 
         return beam_results
 

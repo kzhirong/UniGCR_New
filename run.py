@@ -35,6 +35,10 @@ def parse_args():
     parser.add_argument('--data_path', type=str, default='data/train_sequences.json')
     parser.add_argument('--grid_mapping', type=str, default='data/semantic_id_kmean.pt',
                         help='Path to semantic ID mapping (RQ-VAE + Dedup)')
+    parser.add_argument('--eval_only', action='store_true',
+                        help='Run evaluation only (no training)')
+    parser.add_argument('--checkpoint', type=str, default='checkpoints/best_model.pt',
+                        help='Path to checkpoint for evaluation')
 
     # 注册 DeepSpeed 参数 (optional - only if DeepSpeed is available)
     if DEEPSPEED_AVAILABLE:
@@ -112,10 +116,51 @@ def main():
     )
     
     if is_main_process():
-        print("Model & Trainer Initialized. Starting Training...")
-    
-    # 7. 开始训练
-    trainer.train()
+        print("Model & Trainer Initialized.")
+
+    # 7. Check if eval-only mode
+    if args.eval_only:
+        if is_main_process():
+            print(f"\n[Eval-Only Mode] Loading checkpoint from {args.checkpoint}...")
+
+        # Load checkpoint
+        if os.path.exists(args.checkpoint):
+            # weights_only=False is safe here since we trust our own checkpoint
+            checkpoint = torch.load(args.checkpoint, map_location=trainer.device, weights_only=False)
+            trainer.model.load_state_dict(checkpoint['model_state_dict'])
+
+            if is_main_process():
+                print(f"✓ Loaded checkpoint from {args.checkpoint}")
+                print(f"\nRunning evaluation on validation set...")
+
+            # Run evaluation with rank-matched beam search (fast!)
+            # Rank-matched generates only k=10 combinations (not k^4=10,000)
+            eval_results = trainer.evaluate(topk=10)
+
+            # Print results
+            if is_main_process():
+                print("\n" + "=" * 60)
+                print("EVALUATION RESULTS")
+                print("=" * 60)
+                print(f"GR Loss:     {eval_results['val_gr_loss']:.4f}")
+                print(f"Hit@10:      {eval_results['Hit@10']:.4f}")
+                print(f"NDCG@10:     {eval_results['NDCG@10']:.4f}")
+
+                if conf.enable_ctr:
+                    print(f"CTR Loss:    {eval_results.get('val_ctr_loss', 0):.4f}")
+                    print(f"AUC:         {eval_results.get('AUC', 0):.4f}")
+                    print(f"LogLoss:     {eval_results.get('LogLoss', 0):.4f}")
+
+                print("=" * 60)
+        else:
+            if is_main_process():
+                print(f"✗ Checkpoint not found at {args.checkpoint}")
+                print("Please ensure the checkpoint file exists or train the model first.")
+    else:
+        # Normal training mode
+        if is_main_process():
+            print("Starting Training...")
+        trainer.train()
 
 if __name__ == "__main__":
     main()
