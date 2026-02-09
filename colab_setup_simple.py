@@ -94,15 +94,25 @@ def setup_colab_environment():
             "Updating UniGCR...",
         )
 
-    # Step 5: Install other dependencies
-    print("\n📦 Step 5: Install other dependencies")
+    # Step 5: Clean up deprecated utils package (fixes circular import)
+    print("\n🧹 Step 5: Clean up deprecated files")
+    deprecated_utils = "/content/UniGCR_New/src/utils"
+    if os.path.exists(deprecated_utils):
+        run_command(
+            f"rm -rf {deprecated_utils}",
+            "Removing deprecated utils package directory..."
+        )
+        print("✅ Removed src/utils/ directory (was causing circular import)")
+
+    # Step 6: Install other dependencies
+    print("\n📦 Step 6: Install other dependencies")
     run_command(
-        "pip install numpy pandas scikit-learn tqdm iopath gin-config deepspeed",
-        "Installing Python packages..."
+        "pip install numpy pandas scikit-learn tqdm iopath gin-config",
+        "Installing Python packages (DeepSpeed not needed for single-GPU)..."
     )
 
-    # Step 6: Clone and install generative_recommenders
-    print("\n📦 Step 6: Install generative_recommenders")
+    # Step 7: Clone and install generative_recommenders
+    print("\n📦 Step 7: Install generative_recommenders")
 
     gen_rec_path = "/content/generative_recommenders"
 
@@ -130,8 +140,8 @@ def setup_colab_environment():
         print("=" * 70)
         return False
 
-    # Step 7: Check fbgemm operations availability
-    print("\n🔧 Step 7: Check fbgemm operations")
+    # Step 8: Check fbgemm operations availability
+    print("\n🔧 Step 8: Check fbgemm operations")
 
     import torch
 
@@ -161,8 +171,8 @@ def setup_colab_environment():
     else:
         print("\n🎉 All required operations available!")
 
-    # Step 8: Verify Research HSTU imports
-    print("\n✅ Step 8: Verify Research HSTU imports")
+    # Step 9: Verify Research HSTU imports
+    print("\n✅ Step 9: Verify Research HSTU imports")
 
     try:
         sys.path.insert(0, gen_rec_path)

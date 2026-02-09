@@ -84,9 +84,29 @@ class GridMapper:
         if not os.path.exists(path):
             print(f"[Warning] GRID mapping not found at {path}")
             return {}
-        with open(path, 'r') as f:
-            raw = json.load(f)
-        return {int(k): v for k, v in raw.items()}
+
+        # Support both .pt (PyTorch tensor) and .json formats
+        if path.endswith('.pt'):
+            # Load PyTorch tensor: shape [num_layers, num_items]
+            # Each column represents an item's semantic codes across layers
+            tensor = torch.load(path)
+            if not isinstance(tensor, torch.Tensor):
+                raise ValueError(f"Expected tensor in {path}, got {type(tensor)}")
+
+            num_layers, num_items = tensor.shape
+            print(f"[GridMapper] Loaded tensor mapping: {num_layers} layers × {num_items} items")
+
+            # Convert to dict: {item_id: [code_L0, code_L1, code_L2, code_Dedup]}
+            mapping = {}
+            for item_id in range(num_items):
+                codes = tensor[:, item_id].tolist()  # Extract column for this item
+                mapping[item_id] = codes
+            return mapping
+        else:
+            # JSON format: {item_id: [code1, code2, ...]}
+            with open(path, 'r') as f:
+                raw = json.load(f)
+            return {int(k): v for k, v in raw.items()}
 
     def _apply_offset(self, codes):
         out = []

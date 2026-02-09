@@ -3,6 +3,7 @@ Modified data loader for Amazon Beauty dataset
 This replaces the simulated data in data.py with real Amazon sequential data
 """
 import torch
+import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import numpy as np
@@ -183,24 +184,42 @@ def get_dataloaders(config):
     if config.use_semantic_seq:
         val_ds.config.sem_total_vocab = train_ds.config.sem_total_vocab
 
-    # Create distributed samplers
-    train_sampler = DistributedSampler(train_ds, shuffle=True)
-    val_sampler = DistributedSampler(val_ds, shuffle=False)
+    # Use distributed samplers only if distributed training is initialized
+    use_distributed = dist.is_available() and dist.is_initialized()
 
-    # Create dataloaders
-    train_dl = DataLoader(
-        train_ds,
-        batch_size=config.batch_size,
-        sampler=train_sampler,
-        num_workers=2,
-        pin_memory=True
-    )
-    val_dl = DataLoader(
-        val_ds,
-        batch_size=config.batch_size,
-        sampler=val_sampler,
-        num_workers=2,
-        pin_memory=True
-    )
+    if use_distributed:
+        print("[DataLoader] Using DistributedSampler for distributed training")
+        train_sampler = DistributedSampler(train_ds, shuffle=True)
+        val_sampler = DistributedSampler(val_ds, shuffle=False)
+        train_dl = DataLoader(
+            train_ds,
+            batch_size=config.batch_size,
+            sampler=train_sampler,
+            num_workers=2,
+            pin_memory=True
+        )
+        val_dl = DataLoader(
+            val_ds,
+            batch_size=config.batch_size,
+            sampler=val_sampler,
+            num_workers=2,
+            pin_memory=True
+        )
+    else:
+        print("[DataLoader] Using regular DataLoader (non-distributed)")
+        train_dl = DataLoader(
+            train_ds,
+            batch_size=config.batch_size,
+            shuffle=True,
+            num_workers=2,
+            pin_memory=True
+        )
+        val_dl = DataLoader(
+            val_ds,
+            batch_size=config.batch_size,
+            shuffle=False,
+            num_workers=2,
+            pin_memory=True
+        )
 
     return train_dl, val_dl
