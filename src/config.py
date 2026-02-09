@@ -36,7 +36,8 @@ class UniGCRConfig:
     
     # --- [模型参数] ---
     embed_dim: int = 64
-    max_seq_len: int = 150  # 需足够容纳 (Sem_Len + Atom_Len + Profile_Len)
+    max_seq_len: int = 153  # Must be: (max_seq_len - 1) % 4 == 0 for 4-layer semantic IDs
+                             # 153 - 1 = 152, and 152 / 4 = 38 items ✓
     hstu_layers: int = 2
     hstu_heads: int = 2
     dropout: float = 0.1

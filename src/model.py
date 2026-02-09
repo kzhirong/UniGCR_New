@@ -59,10 +59,14 @@ class UnifiedInputLayer(nn.Module):
             tokens.append(self.atom_emb(input_dict['atom_history']))
             
         # C. Semantic Sequence (RQ-VAE + Deduplication: 4 tokens per item)
-        # sem_history is flattened: [tok0_L0, tok0_L1, tok0_L2, tok0_Dedup, tok1_L0, tok1_L1, tok1_L2, tok1_Dedup, ...]
-        # We need to reshape to (B, num_items, num_layers) and embed each layer separately
+        # sem_history is flattened with offsets applied by GridMapper:
+        # [tok0_L0, tok0_L1, tok0_L2, tok0_Dedup, tok1_L0, tok1_L1, tok1_L2, tok1_Dedup, ...]
+        # We need to:
+        # 1. Reshape to (B, num_items, num_layers)
+        # 2. Remove layer offsets to get raw codes (0-255 for L0/L1/L2, 0-18 for Dedup)
+        # 3. Embed each layer separately
         if self.config.use_semantic_seq and 'sem_history' in input_dict:
-            sem_history = input_dict['sem_history']  # (B, N) - flattened tokens
+            sem_history = input_dict['sem_history']  # (B, N) - flattened tokens with offsets
             batch_size, total_tokens = sem_history.shape
 
             # Reshape: (B, N) → (B, num_items, num_layers)
@@ -70,10 +74,34 @@ class UnifiedInputLayer(nn.Module):
             num_items = total_tokens // self.num_semantic_layers
             sem_tokens = sem_history.view(batch_size, num_items, self.num_semantic_layers)
 
+            # Layer offset ranges (computed by GridMapper):
+            # L0: [1, 257)    → raw codes 0-255 (subtract 1)
+            # L1: [257, 513)  → raw codes 0-255 (subtract 257)
+            # L2: [513, 769)  → raw codes 0-255 (subtract 513)
+            # Dedup: [769, 788) → raw codes 0-18 (subtract 769)
+            layer_offsets = [
+                1,    # L0 offset
+                1 + self.config.sem_id_codebook_size,  # L1 offset (1 + 256 = 257)
+                1 + 2 * self.config.sem_id_codebook_size,  # L2 offset (1 + 512 = 513)
+                1 + 3 * self.config.sem_id_codebook_size,  # Dedup offset (1 + 768 = 769)
+            ]
+
             # Embed each layer separately and sum them
             layer_embeddings = []
             for layer_idx in range(self.num_semantic_layers):
-                layer_tokens = sem_tokens[:, :, layer_idx]  # (B, num_items)
+                layer_tokens_offset = sem_tokens[:, :, layer_idx]  # (B, num_items) - with offset
+
+                # Remove offset to get raw codes for embedding lookup
+                layer_tokens = layer_tokens_offset - layer_offsets[layer_idx]  # (B, num_items) - raw codes
+
+                # Get vocab size for this layer from the embedding layer
+                vocab_size = self.sem_emb_layers[layer_idx].num_embeddings
+
+                # Clamp to valid range [0, vocab_size-1]
+                # - Padding token (0) becomes negative after offset removal → clamp to 0
+                # - Any out-of-range tokens → clamp to vocab_size-1
+                layer_tokens = torch.clamp(layer_tokens, min=0, max=vocab_size - 1)
+
                 layer_emb = self.sem_emb_layers[layer_idx](layer_tokens)  # (B, num_items, D)
                 layer_embeddings.append(layer_emb)
 

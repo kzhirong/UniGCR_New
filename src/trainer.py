@@ -137,11 +137,11 @@ class UniGCRTrainer:
             # --- Task A: Generative Retrieval (GR) ---
             if self.config.use_semantic_seq:
                 # gr_logits: List of 4 tensors
-                # - logits_L0: (B, num_items, 256)
-                # - logits_L1: (B, num_items, 256)
-                # - logits_L2: (B, num_items, 256)
-                # - logits_Dedup: (B, num_items, 19)
-                # sem_target: (B, num_items, 4) - targets for all 4 layers
+                # - logits_L0: (B, num_items, 256)  - predicting raw codes 0-255
+                # - logits_L1: (B, num_items, 256)  - predicting raw codes 0-255
+                # - logits_L2: (B, num_items, 256)  - predicting raw codes 0-255
+                # - logits_Dedup: (B, num_items, 19) - predicting raw codes 0-18
+                # sem_target: (B, num_items*4) or (B, num_items, 4) - targets WITH offsets
 
                 # Reshape targets to (B, num_items, 4) if flattened
                 sem_target = batch['sem_target']
@@ -152,12 +152,30 @@ class UniGCRTrainer:
                     num_items = sem_target.size(1) // self.config.sem_id_layers
                     sem_target = sem_target.view(B, num_items, self.config.sem_id_layers)
 
+                # Layer offsets (same as in model.py):
+                # L0: offset 1, L1: offset 257, L2: offset 513, Dedup: offset 769
+                layer_offsets = [
+                    1,
+                    1 + self.config.sem_id_codebook_size,
+                    1 + 2 * self.config.sem_id_codebook_size,
+                    1 + 3 * self.config.sem_id_codebook_size,
+                ]
+
                 # Compute loss for each layer separately
                 loss_gr = 0.0
                 for layer_idx, logits_layer in enumerate(gr_logits):
                     # logits_layer: (B, num_items, vocab_size_for_layer)
-                    # targets_layer: (B, num_items)
-                    targets_layer = sem_target[:, :, layer_idx]
+                    # targets_layer: (B, num_items) - WITH offset
+                    targets_layer_offset = sem_target[:, :, layer_idx]
+
+                    # Remove offset to get raw codes (0-255 for L0/L1/L2, 0-18 for Dedup)
+                    targets_layer = targets_layer_offset - layer_offsets[layer_idx]
+
+                    # Get vocab size from logits shape (last dimension)
+                    vocab_size = logits_layer.size(-1)
+
+                    # Clamp to valid range [0, vocab_size-1]
+                    targets_layer = torch.clamp(targets_layer, min=0, max=vocab_size - 1)
 
                     # Flatten for cross entropy
                     logits_flat = logits_layer.reshape(-1, logits_layer.size(-1))
@@ -264,7 +282,7 @@ class UniGCRTrainer:
             # 2. GR Val Loss
             if self.config.use_semantic_seq:
                 # gr_logits: List of 4 tensors with different vocab sizes
-                # sem_target: (B, num_items, 4) or (B, num_items*4) flattened
+                # sem_target: (B, num_items, 4) or (B, num_items*4) flattened - WITH offsets
 
                 # Reshape targets to (B, num_items, 4) if flattened
                 sem_target = batch['sem_target']
@@ -274,10 +292,28 @@ class UniGCRTrainer:
                     num_items = sem_target.size(1) // self.config.sem_id_layers
                     sem_target = sem_target.view(B, num_items, self.config.sem_id_layers)
 
+                # Layer offsets (same as in train_epoch)
+                layer_offsets = [
+                    1,
+                    1 + self.config.sem_id_codebook_size,
+                    1 + 2 * self.config.sem_id_codebook_size,
+                    1 + 3 * self.config.sem_id_codebook_size,
+                ]
+
                 # Compute loss for each layer separately
                 loss_gr = 0.0
                 for layer_idx, logits_layer in enumerate(gr_logits):
-                    targets_layer = sem_target[:, :, layer_idx]
+                    targets_layer_offset = sem_target[:, :, layer_idx]
+
+                    # Remove offset to get raw codes
+                    targets_layer = targets_layer_offset - layer_offsets[layer_idx]
+
+                    # Get vocab size from logits shape
+                    vocab_size = logits_layer.size(-1)
+
+                    # Clamp to valid range [0, vocab_size-1]
+                    targets_layer = torch.clamp(targets_layer, min=0, max=vocab_size - 1)
+
                     logits_flat = logits_layer.reshape(-1, logits_layer.size(-1))
                     targets_flat = targets_layer.reshape(-1)
                     loss_gr += self.gr_criterion(logits_flat, targets_flat)
