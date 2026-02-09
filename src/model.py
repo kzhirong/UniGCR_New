@@ -460,7 +460,7 @@ class UniGCRModel(nn.Module):
             candidates: (B, k) tensor of predicted item indices
         """
         # 1. Forward pass to get user state
-        u, _ = self.forward(batch_dict)
+        u, _, _ = self.forward(batch_dict)  # forward returns (u, logits_seq, None)
 
         # 2. Use beam search to generate top-k semantic code candidates
         # beam_results shape: (B, k, num_layers)

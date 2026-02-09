@@ -1,7 +1,27 @@
 import sys
 import os
 import argparse
-import deepspeed
+import torch
+
+# CRITICAL: Import fbgemm_gpu FIRST to register custom ops
+# This must happen before any torch.ops.fbgemm calls
+try:
+    import fbgemm_gpu
+    # Test that ops are available
+    torch.ops.fbgemm.asynchronous_complete_cumsum
+    print("[✓] fbgemm_gpu loaded successfully")
+except (ImportError, AttributeError) as e:
+    print(f"[WARNING] fbgemm_gpu not available: {e}")
+    print("Install with: pip install fbgemm-gpu==1.1.0 --index-url https://download.pytorch.org/whl/cu124")
+
+# Import DeepSpeed if available (optional)
+try:
+    import deepspeed
+    DEEPSPEED_AVAILABLE = True
+except ImportError:
+    DEEPSPEED_AVAILABLE = False
+    print("[Note] DeepSpeed not available - will use regular PyTorch training")
+
 from src.config import UniGCRConfig
 from src.data_amazon import get_dataloaders
 from src.model import UniGCRModel
@@ -16,8 +36,14 @@ def parse_args():
     parser.add_argument('--grid_mapping', type=str, default='data/semantic_id_kmean.pt',
                         help='Path to semantic ID mapping (RQ-VAE + Dedup)')
 
-    # 注册 DeepSpeed 参数 (这会自动添加 --deepspeed_config, --local_rank 等)
-    parser = deepspeed.add_config_arguments(parser)
+    # 注册 DeepSpeed 参数 (optional - only if DeepSpeed is available)
+    if DEEPSPEED_AVAILABLE:
+        parser = deepspeed.add_config_arguments(parser)
+    else:
+        # Add placeholder for deepspeed_config when DeepSpeed not available
+        parser.add_argument('--deepspeed_config', type=str, default=None,
+                          help='DeepSpeed config (ignored if DeepSpeed not installed)')
+
     args = parser.parse_args()
     return args
 

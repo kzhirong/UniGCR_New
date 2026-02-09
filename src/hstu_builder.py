@@ -15,6 +15,19 @@ from typing import Dict, Optional
 
 from .config import UniGCRConfig
 
+# IMPORTANT: Import fbgemm_gpu BEFORE using torch.ops.fbgemm
+# This ensures the custom ops are registered
+try:
+    import fbgemm_gpu
+    # Verify critical ops are available
+    torch.ops.fbgemm.asynchronous_complete_cumsum
+    torch.ops.fbgemm.dense_to_jagged
+    torch.ops.fbgemm.jagged_to_padded_dense
+except (ImportError, AttributeError) as e:
+    print(f"[WARNING] fbgemm_gpu operations not available: {e}")
+    print("Research HSTU requires fbgemm_gpu. Install with:")
+    print("  pip install fbgemm-gpu==1.1.0 --index-url https://download.pytorch.org/whl/cu124")
+
 # Import from generative_recommenders - Research HSTU
 try:
     from generative_recommenders.research.modeling.sequential.hstu import HSTU
