@@ -100,17 +100,17 @@ class UniGCRTrainer:
         """
         self.model.train()
 
-        # Scheduled Sampling: Gradually reduce teacher forcing ratio
-        # Epochs 1-5: Full teacher forcing (1.0)
-        # Epochs 6-15: Linear decay (1.0 → 0.3)
-        # Epochs 16+: Partial teacher forcing (0.3)
-        if epoch_idx <= 5:
+        # Scheduled Sampling: Gradually reduce teacher forcing ratio (CONSERVATIVE)
+        # Epochs 1-10: Full teacher forcing (1.0) - learn correct code space first
+        # Epochs 11-30: Slow linear decay (1.0 → 0.7) - gradual exposure to errors
+        # Epochs 31+: Maintain high TF (0.7) - keep model grounded in correct codes
+        if epoch_idx <= 10:
             teacher_forcing_ratio = 1.0
-        elif epoch_idx <= 15:
-            # Linear decay from 1.0 to 0.3 over epochs 6-15
-            teacher_forcing_ratio = 1.0 - 0.7 * (epoch_idx - 5) / 10
+        elif epoch_idx <= 30:
+            # Slow decay from 1.0 to 0.7 over epochs 11-30
+            teacher_forcing_ratio = 1.0 - 0.3 * (epoch_idx - 10) / 20
         else:
-            teacher_forcing_ratio = 0.3
+            teacher_forcing_ratio = 0.7
 
         # Set the ratio on the model
         self.model.teacher_forcing_ratio = teacher_forcing_ratio
@@ -318,7 +318,7 @@ class UniGCRTrainer:
 
         for batch in iterator:
             batch = {k: v.to(self.device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
-            
+
             # --- A. 计算 Validation Loss ---
             # 1. Forward
             u, gr_logits, _ = self.model(batch)
