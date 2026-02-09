@@ -127,7 +127,26 @@ class UniGCRTrainer:
 
             self.optimizer.zero_grad()
 
-            # 2. Forward Pass (Shared Backbone & GR Head)
+            # 2. Prepare target codes for autoregressive teacher forcing
+            if self.config.use_semantic_seq and 'sem_target' in batch:
+                sem_target = batch['sem_target']
+                B = sem_target.size(0)
+
+                # Reshape if flattened
+                if sem_target.dim() == 2 and sem_target.size(1) % self.config.sem_id_layers == 0:
+                    num_items = sem_target.size(1) // self.config.sem_id_layers
+                    sem_target = sem_target.view(B, num_items, self.config.sem_id_layers)
+
+                # Remove offsets to get RAW codes for teacher forcing
+                # sem_target: (B, num_items, 4) with offsets [1-256, 257-512, 513-768, 769-787]
+                # target_codes_seq: (B, num_items, 4) WITHOUT offsets [0-255, 0-255, 0-255, 0-18]
+                layer_offsets = torch.tensor([1, 257, 513, 769], device=sem_target.device)
+                target_codes_seq = sem_target - layer_offsets.view(1, 1, -1)  # Broadcast and subtract
+
+                # Add to batch for model access
+                batch['target_codes_seq'] = target_codes_seq
+
+            # 3. Forward Pass (Shared Backbone & GR Head with Autoregressive Prediction)
             # u: User State (B, D)
             # gr_logits: List of 4 tensors (L0, L1, L2, Dedup) with different vocab sizes
             u, gr_logits, _ = self.model(batch)
@@ -343,40 +362,20 @@ class UniGCRTrainer:
                 batch, k=topk, grid_mapper=grid_mapper
             )
 
-            # DEBUG: Check candidates on first batch
-            if is_main_process() and all_gr_count == 0:
-                print(f"\n[DEBUG] Candidate predictions (Weighted Hamming Distance):")
-                print(f"  Candidates shape: {candidates.shape}")
-                print(f"  First 3 users, first 5 candidates each:")
-                for i in range(min(3, candidates.size(0))):
-                    print(f"    User {i}: {candidates[i, :5].tolist()}")
-                print(f"  Unique candidates across all users: {torch.unique(candidates).size(0)}")
-                print(f"  Candidate range: [{candidates.min().item()}, {candidates.max().item()}]")
+            # DEBUG: Check first batch only (disabled for cleaner output)
+            # if is_main_process() and all_gr_count == 0:
+            #     print(f"\n[DEBUG] Candidates: {torch.unique(candidates).size(0)} unique items")
+            #     print(f"  First 3 users: {[candidates[i, :5].tolist() for i in range(3)]}")
 
             # Compute Hit@k and NDCG@k
             # sem_target_eval: (B,) - ground truth item indices
             # candidates: (B, k) - predicted item IDs
             target_item_ids = batch.get('sem_target_eval', None)
 
-            # DEBUG: Check targets on first batch
-            if is_main_process() and all_gr_count == 0:
-                if target_item_ids is not None:
-                    print(f"\n[DEBUG] Targets:")
-                    print(f"  Target shape: {target_item_ids.shape}")
-                    print(f"  First 5 targets: {target_item_ids[:5].tolist()}")
-                else:
-                    print(f"\n[DEBUG] target_item_ids is None! Batch keys: {batch.keys()}")
-
             if target_item_ids is not None:
                 batch_hit, batch_ndcg = compute_gr_metrics(
                     candidates, target_item_ids, k=topk
                 )
-
-                # DEBUG: Check metrics on first batch
-                if is_main_process() and all_gr_count == 0:
-                    print(f"\n[DEBUG] Metrics:")
-                    print(f"  batch_hit: {batch_hit}")
-                    print(f"  batch_ndcg: {batch_ndcg}")
 
                 all_hit_sums += batch_hit * target_item_ids.size(0)
                 all_ndcg_sums += batch_ndcg * target_item_ids.size(0)

@@ -130,6 +130,12 @@ class UniGCRModel(nn.Module):
         self.gr_head_L2 = nn.Linear(config.embed_dim, config.sem_id_codebook_size)      # vocab=256
         self.gr_head_Dedup = nn.Linear(config.embed_dim, config.sem_id_dedup_size)      # vocab=19
 
+        # 3b. Autoregressive Combiners - project concatenated embeddings back to embed_dim
+        # These allow each layer to condition on previous layer predictions
+        self.autoregressive_combiner_L1 = nn.Linear(config.embed_dim * 2, config.embed_dim)     # u + emb_L0
+        self.autoregressive_combiner_L2 = nn.Linear(config.embed_dim * 3, config.embed_dim)     # u + emb_L0 + emb_L1
+        self.autoregressive_combiner_Dedup = nn.Linear(config.embed_dim * 4, config.embed_dim)  # u + emb_L0 + emb_L1 + emb_L2
+
         # 4. CTR Components (will be used in Phase 2)
         if config.enable_ctr:
             self.cand_proj = nn.Sequential(
@@ -206,16 +212,40 @@ class UniGCRModel(nn.Module):
         # Slice to only the actual number of items (HSTU pads to max_output_len internally)
         full_embeddings = full_embeddings_all[:, :num_items, :]  # (B, num_items, D)
 
-        # 6. Prediction heads - predict all 4 semantic tokens for complete items
-        # Each position predicts the next item's [L0, L1, L2, Dedup] tokens
-        logits_L0 = self.gr_head_L0(full_embeddings)      # (B, num_items, 256)
-        logits_L1 = self.gr_head_L1(full_embeddings)      # (B, num_items, 256)
-        logits_L2 = self.gr_head_L2(full_embeddings)      # (B, num_items, 256)
-        logits_Dedup = self.gr_head_Dedup(full_embeddings)  # (B, num_items, 19)
+        # 6. Autoregressive Prediction - each layer conditioned on previous layers
+        # Each position predicts the next item's [L0, L1, L2, Dedup] tokens autoregressively
 
-        # Return as list since vocab sizes differ (256, 256, 256, 19)
-        # List of 4 tensors: [L0_logits, L1_logits, L2_logits, Dedup_logits]
-        logits_seq = [logits_L0, logits_L1, logits_L2, logits_Dedup]
+        # Prepare target codes for teacher forcing (if available during training)
+        target_codes_seq = batch_dict.get('target_codes_seq', None)  # (B, num_items, 4) if provided
+
+        # Initialize lists to collect logits for each layer across all positions
+        all_logits = [[], [], [], []]  # List for each layer: [L0_list, L1_list, L2_list, Dedup_list]
+
+        # Loop through each position and predict autoregressively
+        for pos in range(num_items):
+            u_pos = full_embeddings[:, pos, :]  # (B, D) - user representation at this position
+
+            # Get target codes for this position (for teacher forcing during training)
+            if target_codes_seq is not None:
+                target_codes_pos = target_codes_seq[:, pos, :]  # (B, 4)
+            else:
+                target_codes_pos = None
+
+            # Autoregressive prediction for this position
+            # Returns: [(B, 256), (B, 256), (B, 256), (B, 19)]
+            logits_list, _ = self.predict_codes_autoregressive(
+                u_pos,
+                target_codes=target_codes_pos,
+                training=self.training
+            )
+
+            # Collect logits for each layer
+            for layer_idx, logits in enumerate(logits_list):
+                all_logits[layer_idx].append(logits.unsqueeze(1))  # (B, 1, vocab)
+
+        # Stack logits across positions: List of [(B, 1, vocab)] -> (B, num_items, vocab)
+        logits_seq = [torch.cat(layer_logits, dim=1) for layer_logits in all_logits]
+        # Result: [(B, num_items, 256), (B, num_items, 256), (B, num_items, 256), (B, num_items, 19)]
 
         # 7. User representation from last valid item position
         batch_indices = torch.arange(batch_size, device=embeddings.device)
@@ -223,6 +253,89 @@ class UniGCRModel(nn.Module):
         u = full_embeddings[batch_indices, last_positions, :]  # (B, D)
 
         return u, logits_seq, None  # candidate_embeddings not used in Research HSTU
+
+    def predict_codes_autoregressive(self, u, target_codes=None, training=True):
+        """
+        Autoregressive prediction of 4-layer semantic codes.
+        Each layer is predicted conditioned on previous layers.
+
+        Args:
+            u: (B, D) user representation from HSTU
+            target_codes: (B, 4) ground truth RAW codes (for teacher forcing during training)
+                         Codes are WITHOUT offsets: [0-255, 0-255, 0-255, 0-18]
+            training: If True, use teacher forcing; else use greedy sampling
+
+        Returns:
+            logits_list: List of 4 tensors [(B, 256), (B, 256), (B, 256), (B, 19)]
+            sampled_codes: List of 4 tensors [(B,), (B,), (B,), (B,)] - codes used for conditioning
+        """
+        logits_list = []
+        sampled_codes = []
+
+        # ============================================================
+        # Layer 0: Predict L0 (unconditional, only depends on user state)
+        # ============================================================
+        context = u  # Start with user embedding
+        logits_L0 = self.gr_head_L0(context)  # (B, 256)
+        logits_list.append(logits_L0)
+
+        # Get code for L0 (teacher forcing or greedy)
+        if training and target_codes is not None:
+            code_L0 = target_codes[:, 0]  # Teacher forcing: use ground truth
+        else:
+            code_L0 = torch.argmax(logits_L0, dim=1)  # Greedy sampling
+        sampled_codes.append(code_L0)
+
+        # ============================================================
+        # Layer 1: Predict L1 conditioned on L0
+        # ============================================================
+        # Embed L0 code and combine with user state
+        emb_L0 = self.input_layer.sem_emb_layers[0](code_L0)  # (B, D)
+        context = torch.cat([u, emb_L0], dim=1)  # (B, 2D)
+        context = self.autoregressive_combiner_L1(context)  # (B, D) - project back
+
+        logits_L1 = self.gr_head_L1(context)  # (B, 256)
+        logits_list.append(logits_L1)
+
+        if training and target_codes is not None:
+            code_L1 = target_codes[:, 1]
+        else:
+            code_L1 = torch.argmax(logits_L1, dim=1)
+        sampled_codes.append(code_L1)
+
+        # ============================================================
+        # Layer 2: Predict L2 conditioned on L0, L1
+        # ============================================================
+        emb_L1 = self.input_layer.sem_emb_layers[1](code_L1)  # (B, D)
+        context = torch.cat([u, emb_L0, emb_L1], dim=1)  # (B, 3D)
+        context = self.autoregressive_combiner_L2(context)  # (B, D)
+
+        logits_L2 = self.gr_head_L2(context)  # (B, 256)
+        logits_list.append(logits_L2)
+
+        if training and target_codes is not None:
+            code_L2 = target_codes[:, 2]
+        else:
+            code_L2 = torch.argmax(logits_L2, dim=1)
+        sampled_codes.append(code_L2)
+
+        # ============================================================
+        # Layer 3: Predict Dedup conditioned on L0, L1, L2
+        # ============================================================
+        emb_L2 = self.input_layer.sem_emb_layers[2](code_L2)  # (B, D)
+        context = torch.cat([u, emb_L0, emb_L1, emb_L2], dim=1)  # (B, 4D)
+        context = self.autoregressive_combiner_Dedup(context)  # (B, D)
+
+        logits_Dedup = self.gr_head_Dedup(context)  # (B, 19)
+        logits_list.append(logits_Dedup)
+
+        if training and target_codes is not None:
+            code_Dedup = target_codes[:, 3]
+        else:
+            code_Dedup = torch.argmax(logits_Dedup, dim=1)
+        sampled_codes.append(code_Dedup)
+
+        return logits_list, sampled_codes
 
     def _get_item_vector(self, codes):
         """
@@ -247,50 +360,138 @@ class UniGCRModel(nn.Module):
     @torch.no_grad()
     def _beam_search_hard_negatives(self, batch_dict, u_current, beam_width=5, grid_mapper=None):
         """
-        Rank-Matched Top-K beam search for parallel 4-layer prediction.
+        Autoregressive beam search for 4-layer semantic code prediction.
 
-        For each semantic layer, independently select top-k predictions,
-        then combine them by matching ranks (rank-1 with rank-1, rank-2 with rank-2, etc).
+        Maintains top-k beams at each layer, where each beam is a partial code sequence.
+        For each layer, we:
+        1. Predict next layer conditioned on previous layers for all beams
+        2. Expand beams by considering all possible next codes
+        3. Keep top-k beams by cumulative log probability
 
-        This is MUCH faster than full cartesian product (k combinations vs k^4).
-        Assumes layers are somewhat correlated (top codes tend to appear together).
+        This ensures generated combinations are valid and high-probability under the model.
 
         Args:
-            batch_dict: Input batch dict (not used in this version, kept for API compatibility)
+            batch_dict: Input batch dict (not used, kept for API compatibility)
             u_current: User state from forward pass (B, D)
             beam_width: Number of candidates to return (k)
-            grid_mapper: GridMapper instance (not used in this version, kept for API compatibility)
+            grid_mapper: GridMapper instance (not used, kept for API compatibility)
 
         Returns:
-            beam_results: (B, k, num_layers) tensor of semantic codes (RAW codes, not offset)
+            beam_results: (B, k, 4) tensor of semantic codes (RAW codes, not offset)
         """
-        # 1. Get predictions for next item from all 4 GR heads
-        # These are the logits for predicting the NEXT item
-        logits_L0 = self.gr_head_L0(u_current)        # (B, 256)
-        logits_L1 = self.gr_head_L1(u_current)        # (B, 256)
-        logits_L2 = self.gr_head_L2(u_current)        # (B, 256)
-        logits_Dedup = self.gr_head_Dedup(u_current)  # (B, 19)
+        B = u_current.size(0)
+        device = u_current.device
 
-        all_logits = [logits_L0, logits_L1, logits_L2, logits_Dedup]
+        # ============================================================
+        # Layer 0: Initialize beams with top-k L0 predictions
+        # ============================================================
+        logits_L0 = self.gr_head_L0(u_current)  # (B, 256)
+        log_probs_L0 = torch.log_softmax(logits_L0, dim=-1)  # (B, 256)
 
-        # 2. For each layer, get top-k predictions (codes only, no log probs needed)
-        layer_topk_codes = []  # List of (B, k) tensors
+        # Get top-k L0 codes and their log probs
+        beam_log_probs, beam_codes_L0 = torch.topk(log_probs_L0, beam_width, dim=-1)
+        # beam_log_probs: (B, k)
+        # beam_codes_L0: (B, k)
 
-        for layer_idx, logits in enumerate(all_logits):
-            # Get top-k codes for this layer
-            _, topk_codes = torch.topk(logits, beam_width, dim=-1)
-            # topk_codes: (B, k) - RAW codes (0-255 for L0/L1/L2, 0-18 for Dedup)
-            layer_topk_codes.append(topk_codes)
+        # Initialize beam state
+        # We'll accumulate codes as we go: start with L0
+        beam_codes = beam_codes_L0.unsqueeze(-1)  # (B, k, 1)
 
-        # 3. Rank-Matched Stacking
-        # Combine rank-1 from all layers, rank-2 from all layers, etc.
-        # Stack along last dimension to get (B, k, 4)
-        # pred_L0[:, 0] with pred_L1[:, 0] with pred_L2[:, 0] with pred_Dedup[:, 0] -> rank-1 combo
-        # pred_L0[:, 1] with pred_L1[:, 1] with pred_L2[:, 1] with pred_Dedup[:, 1] -> rank-2 combo
-        # ...
-        beam_results = torch.stack(layer_topk_codes, dim=-1)  # (B, k, 4)
+        # ============================================================
+        # Layer 1: Predict L1 conditioned on L0 for each beam
+        # ============================================================
+        # Expand u_current to match beam dimension: (B, k, D)
+        u_expanded = u_current.unsqueeze(1).expand(B, beam_width, -1)  # (B, k, D)
 
-        return beam_results
+        # Get L0 embeddings for all beams
+        emb_L0 = self.input_layer.sem_emb_layers[0](beam_codes_L0)  # (B, k, D)
+
+        # Combine with user state and project
+        context = torch.cat([u_expanded, emb_L0], dim=-1)  # (B, k, 2D)
+        context = context.view(B * beam_width, -1)  # (B*k, 2D)
+        context = self.autoregressive_combiner_L1(context)  # (B*k, D)
+
+        # Predict L1
+        logits_L1 = self.gr_head_L1(context)  # (B*k, 256)
+        logits_L1 = logits_L1.view(B, beam_width, 256)  # (B, k, 256)
+        log_probs_L1 = torch.log_softmax(logits_L1, dim=-1)  # (B, k, 256)
+
+        # Expand beams: each of k beams can branch into 256 L1 codes
+        # New beam scores: old_score + new_log_prob
+        expanded_log_probs = beam_log_probs.unsqueeze(-1) + log_probs_L1  # (B, k, 256)
+        expanded_log_probs = expanded_log_probs.view(B, -1)  # (B, k*256)
+
+        # Keep top-k
+        beam_log_probs, topk_indices = torch.topk(expanded_log_probs, beam_width, dim=-1)
+        # beam_log_probs: (B, k)
+        # topk_indices: (B, k) - indices in flattened (k*256) space
+
+        # Decode which beam and which L1 code
+        beam_indices = topk_indices // 256  # Which of the k original beams
+        codes_L1 = topk_indices % 256  # Which L1 code
+
+        # Update beam_codes: gather L0 codes from selected beams, append L1
+        # Use advanced indexing to select beams
+        batch_indices = torch.arange(B, device=device).unsqueeze(1).expand(B, beam_width)
+        beam_codes_L0_selected = beam_codes_L0[batch_indices, beam_indices]  # (B, k)
+        beam_codes = torch.stack([beam_codes_L0_selected, codes_L1], dim=-1)  # (B, k, 2)
+
+        # ============================================================
+        # Layer 2: Predict L2 conditioned on L0, L1 for each beam
+        # ============================================================
+        # Get embeddings for current beams
+        emb_L0 = self.input_layer.sem_emb_layers[0](beam_codes[:, :, 0])  # (B, k, D)
+        emb_L1 = self.input_layer.sem_emb_layers[1](beam_codes[:, :, 1])  # (B, k, D)
+
+        # Combine and predict
+        context = torch.cat([u_expanded, emb_L0, emb_L1], dim=-1)  # (B, k, 3D)
+        context = context.view(B * beam_width, -1)  # (B*k, 3D)
+        context = self.autoregressive_combiner_L2(context)  # (B*k, D)
+
+        logits_L2 = self.gr_head_L2(context)  # (B*k, 256)
+        logits_L2 = logits_L2.view(B, beam_width, 256)
+        log_probs_L2 = torch.log_softmax(logits_L2, dim=-1)
+
+        # Expand and keep top-k
+        expanded_log_probs = beam_log_probs.unsqueeze(-1) + log_probs_L2
+        expanded_log_probs = expanded_log_probs.view(B, -1)
+        beam_log_probs, topk_indices = torch.topk(expanded_log_probs, beam_width, dim=-1)
+
+        beam_indices = topk_indices // 256
+        codes_L2 = topk_indices % 256
+
+        # Update beam_codes
+        beam_codes_prev = beam_codes[batch_indices, beam_indices]  # (B, k, 2)
+        beam_codes = torch.cat([beam_codes_prev, codes_L2.unsqueeze(-1)], dim=-1)  # (B, k, 3)
+
+        # ============================================================
+        # Layer 3: Predict Dedup conditioned on L0, L1, L2 for each beam
+        # ============================================================
+        emb_L0 = self.input_layer.sem_emb_layers[0](beam_codes[:, :, 0])
+        emb_L1 = self.input_layer.sem_emb_layers[1](beam_codes[:, :, 1])
+        emb_L2 = self.input_layer.sem_emb_layers[2](beam_codes[:, :, 2])
+
+        context = torch.cat([u_expanded, emb_L0, emb_L1, emb_L2], dim=-1)  # (B, k, 4D)
+        context = context.view(B * beam_width, -1)
+        context = self.autoregressive_combiner_Dedup(context)
+
+        logits_Dedup = self.gr_head_Dedup(context)  # (B*k, 19)
+        logits_Dedup = logits_Dedup.view(B, beam_width, 19)
+        log_probs_Dedup = torch.log_softmax(logits_Dedup, dim=-1)
+
+        # Expand and keep top-k
+        expanded_log_probs = beam_log_probs.unsqueeze(-1) + log_probs_Dedup
+        expanded_log_probs = expanded_log_probs.view(B, -1)  # (B, k*19)
+        beam_log_probs, topk_indices = torch.topk(expanded_log_probs, beam_width, dim=-1)
+
+        beam_indices = topk_indices // 19
+        codes_Dedup = topk_indices % 19
+
+        # Final beam_codes
+        beam_codes_prev = beam_codes[batch_indices, beam_indices]  # (B, k, 3)
+        beam_codes = torch.cat([beam_codes_prev, codes_Dedup.unsqueeze(-1)], dim=-1)  # (B, k, 4)
+
+        return beam_codes
 
     def predict_ctr(self, u, batch_dict, pos_codes, device, grid_mapper):
         """
@@ -410,21 +611,10 @@ class UniGCRModel(nn.Module):
             offsets = torch.tensor([1, 257, 513, 769], device=codes_flat.device)
             codes_offset = codes_flat + offsets  # (B*k, 4)
 
-            # DEBUG: Print first 3 lookups before batch processing (only first batch)
-            if codes_offset.size(0) >= 10:  # Only print for first batch
-                print(f"\n[DEBUG] Batch nearest neighbor lookup:")
-                print(f"  Batch size: {codes_offset.size(0)} predictions")
-                for i in range(min(3, codes_offset.size(0))):
-                    print(f"  Prediction {i}: raw={codes_flat[i].tolist()}, offset={codes_offset[i].tolist()}")
-                if codes_offset.size(0) > 0:
-                    sample_keys = list(grid_mapper.reverse_mapping.keys())[:5]
-                    print(f"  Sample valid codes: {sample_keys}")
-                    print(f"  [Note] Using Weighted Hamming Distance:")
-                    print(f"         - L0 weight=8 (coarse category)")
-                    print(f"         - L1 weight=4 (subcategory)")
-                    print(f"         - L2 weight=2 (details)")
-                    print(f"         - Dedup weight=1 (collision ID)")
-                    print(f"         - Perfect match=0, all wrong=15")
+            # DEBUG: Disabled for cleaner output
+            # Uncomment below to debug prediction codes
+            # if codes_offset.size(0) >= 10:
+            #     print(f"\n[DEBUG] Predictions: {codes_flat[:3].tolist()}")
 
             # Vectorized batch nearest neighbor lookup (FAST!)
             # This replaces the slow loop with a single batched operation
