@@ -24,7 +24,7 @@ class UniGCRConfig:
     sem_id_layers: int = 4  # 4 layers including deduplication
     sem_id_codebook_size: int = 256  # Codebook size for L0, L1, L2
     sem_id_dedup_size: int = 19  # Deduplication column vocabulary (0-18)
-    grid_mapping_path: str = "data/beauty/semantic_ids.json"
+    grid_mapping_path: str = "data/semantic_id_kmean.pt"
     
     # --- [Atomic ID] ---
     num_atomic_items: int = 0
@@ -36,8 +36,9 @@ class UniGCRConfig:
     
     # --- [模型参数] ---
     embed_dim: int = 64
-    max_seq_len: int = 153  # Must be: (max_seq_len - 1) % 4 == 0 for 4-layer semantic IDs
-                             # 153 - 1 = 152, and 152 / 4 = 38 items ✓
+    max_seq_len: int = 153   # Must be: (max_seq_len - 1) % 4 == 0 for 4-layer semantic IDs
+                             # 41 - 1 = 40, and 40 / 4 = 10 items ✓
+                             # (153 = 38 items is the theoretical max; 41 is safe for all GPUs)
     hstu_layers: int = 2
     hstu_heads: int = 2
     dropout: float = 0.1
@@ -54,7 +55,7 @@ class UniGCRConfig:
     
     # --- [训练参数] ---
     patience: int = 30  # Increased to allow conservative scheduled sampling (epochs 1-30)
-    batch_size: int = 64
+    batch_size: int = 256
     lr: float = 1e-3
     epochs: int = 50
     device: str = "cuda" if torch.cuda.is_available() else "cpu"

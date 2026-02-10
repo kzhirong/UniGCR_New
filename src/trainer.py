@@ -43,6 +43,7 @@ class UniGCRTrainer:
         if use_deepspeed:
             # --- DeepSpeed Path (Multi-GPU or explicitly requested) ---
             print("[Trainer] Using DeepSpeed training")
+            self.lr_scheduler = None  # DeepSpeed manages LR internally
             ds_config = None
             if hasattr(args, 'deepspeed_config') and args.deepspeed_config:
                 try:
@@ -71,14 +72,22 @@ class UniGCRTrainer:
             self.model = model.to(self.device)
 
             # Create optimizer
-            lr = getattr(args, 'learning_rate', 1e-4)
+            lr = getattr(config, 'lr', getattr(args, 'learning_rate', 1e-4))
             self.optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+
+            # Cosine LR decay: warm lr → 1e-5 over all epochs.
+            # This prevents training from stalling at a flat plateau.
+            self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=config.epochs,
+                eta_min=1e-5,
+            )
 
             # No model_engine in regular mode
             self.model_engine = None
             self.use_deepspeed = False
 
-            print(f"[Trainer] Device: {self.device}, Learning rate: {lr}")
+            print(f"[Trainer] Device: {self.device}, Learning rate: {lr} → 1e-5 (cosine)")
 
         # ── Automatic Mixed Precision (AMP) ──────────────────────────────────
         # DeepSpeed handles its own AMP (fp16/bf16 via ds_config).
@@ -126,22 +135,20 @@ class UniGCRTrainer:
 
         # Scheduled sampling:
         #   Epochs  1-10 : TF = 1.0  (full teacher forcing — model learns correct code space)
-        #   Epochs 11-30 : TF linearly 1.0 → 0.5  (reduce exposure bias gradually)
-        #   Epochs 31+   : TF = 0.5  (steady mix so model handles its own errors)
+        #   Epochs 11-40 : TF linearly 1.0 → 0.0  (close the inference gap completely)
+        #   Epochs 41+   : TF = 0.0  (pure self-prediction, identical to beam search at eval)
         #
-        # WHY this is needed:
-        #   With TF=1.0, L1/L2/D are conditioned on TRUE L0 during training.
-        #   At inference, L0 is imperfect (e.g. biased to the most-common code).
-        #   L1/L2/D have never seen a wrong L0, so their inference predictions collapse.
-        #   Gradually exposing them to the model's own L0 predictions during training
-        #   (a) forces L1/L2/D to be robust to imperfect L0
-        #   (b) creates a gradient signal that pushes L0 to be more discriminative
+        # WHY go all the way to 0.0 (vs old 0.5 floor):
+        #   At TF=0.5 the model still sees true L0 half the time, so short-history samples
+        #   collapse to modal L0 codes (14/15) because there is no penalty for being wrong
+        #   50% of steps.  Reaching TF=0.0 forces L0 to be correct under its own predictions,
+        #   matching the pure-inference condition used by beam search at evaluation.
         if epoch_idx <= 10:
             teacher_forcing_ratio = 1.0
-        elif epoch_idx <= 30:
-            teacher_forcing_ratio = 1.0 - 0.5 * (epoch_idx - 10) / 20  # 1.0 → 0.5
+        elif epoch_idx <= 40:
+            teacher_forcing_ratio = 1.0 - (epoch_idx - 10) / 30  # 1.0 → 0.0 over 30 epochs
         else:
-            teacher_forcing_ratio = 0.5
+            teacher_forcing_ratio = 0.0
 
         self.model.teacher_forcing_ratio = teacher_forcing_ratio
 
@@ -416,6 +423,12 @@ class UniGCRTrainer:
         # Import metrics functions
         from .utils import compute_gr_metrics
 
+        # Force TF=0.0 during evaluation so val_gr_loss and Hit@10 both reflect
+        # true inference conditions (no ground-truth peeking).
+        # Restore the training TF ratio afterward.
+        train_tf = getattr(self.model, 'teacher_forcing_ratio', 1.0)
+        self.model.teacher_forcing_ratio = 0.0
+
         self.model.eval()
         grid_mapper = self.val_loader.dataset.grid_mapper
 
@@ -578,6 +591,9 @@ class UniGCRTrainer:
                 results['AUC'] = auc
                 results['LogLoss'] = logloss
 
+        # Restore training TF ratio before returning
+        self.model.teacher_forcing_ratio = train_tf
+
         return results
 
     def save(self, tag):
@@ -623,7 +639,14 @@ class UniGCRTrainer:
             
             # 1. Train
             train_metrics = self.train_epoch(epoch)
-            
+
+            # Step LR scheduler after each epoch (cosine decay)
+            if self.lr_scheduler is not None:
+                self.lr_scheduler.step()
+                if is_main_process():
+                    current_lr = self.optimizer.param_groups[0]['lr']
+                    train_metrics['lr'] = current_lr
+
             # 2. Eval
             eval_metrics = self.evaluate(topk=10)
             
@@ -637,6 +660,8 @@ class UniGCRTrainer:
                 else:
                     log_str += "| "
                 
+                if 'lr' in train_metrics:
+                    log_str += f"LR={train_metrics['lr']:.2e} | "
                 log_str += f"Eval: "
                 log_str += f"Hit@10={eval_metrics['Hit@10']:.4f} NDCG@10={eval_metrics['NDCG@10']:.4f} GR_Loss={eval_metrics['val_gr_loss']:.4f} "
                 
