@@ -135,20 +135,20 @@ class UniGCRTrainer:
 
         # Scheduled sampling:
         #   Epochs  1-10 : TF = 1.0  (full teacher forcing — model learns correct code space)
-        #   Epochs 11-40 : TF linearly 1.0 → 0.0  (close the inference gap completely)
-        #   Epochs 41+   : TF = 0.0  (pure self-prediction, identical to beam search at eval)
+        #   Epochs 11-40 : TF linearly 1.0 → 0.1  (reduce exposure bias while keeping a small
+        #                  ground-truth signal so L1/L2 don't cascade-collapse on wrong L0)
+        #   Epochs 41+   : TF = 0.1  (90% self-prediction; 10% ground-truth prevents L1 bias)
         #
-        # WHY go all the way to 0.0 (vs old 0.5 floor):
-        #   At TF=0.5 the model still sees true L0 half the time, so short-history samples
-        #   collapse to modal L0 codes (14/15) because there is no penalty for being wrong
-        #   50% of steps.  Reaching TF=0.0 forces L0 to be correct under its own predictions,
-        #   matching the pure-inference condition used by beam search at evaluation.
+        # WHY 0.1 floor instead of 0.0:
+        #   At TF=0.0, L0 is almost always wrong early → L1 always sees OOD L0 → L1 collapses
+        #   to its own modal codes (cascading bias).  Keeping 10% true L0 conditioning lets L1
+        #   occasionally reinforce the correct P(L1|true L0, history) distribution.
         if epoch_idx <= 10:
             teacher_forcing_ratio = 1.0
         elif epoch_idx <= 40:
-            teacher_forcing_ratio = 1.0 - (epoch_idx - 10) / 30  # 1.0 → 0.0 over 30 epochs
+            teacher_forcing_ratio = max(0.1, 1.0 - (epoch_idx - 10) / 30)  # 1.0 → 0.1 over 30 epochs
         else:
-            teacher_forcing_ratio = 0.0
+            teacher_forcing_ratio = 0.1
 
         self.model.teacher_forcing_ratio = teacher_forcing_ratio
 
