@@ -14,8 +14,7 @@ import json
 from collections import Counter
 from src.config import UniGCRConfig
 from src.model import UniGCRModel
-from src.data import get_dataloaders
-from src.grid_utils import GridMapper
+from src.data_amazon import get_dataloaders
 
 def diagnose():
     print("=" * 80)
@@ -26,20 +25,23 @@ def diagnose():
     config = UniGCRConfig()
     config.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Load grid mapper
-    grid_mapper = GridMapper(config.grid_mapping_path)
+    # Set data path (required by get_dataloaders)
+    config.data_path = 'data/train_sequences.json'
+
+    # Load validation data (grid_mapper is created inside)
+    _, val_loader = get_dataloaders(config)
+
+    # Get grid mapper from the dataset
+    grid_mapper = val_loader.dataset.grid_mapper
     config.sem_total_vocab = grid_mapper.total_vocab_size
 
     # Load model
     print("\n📦 Loading model from checkpoint...")
     model = UniGCRModel(config).to(config.device)
-    checkpoint = torch.load("checkpoints/best_model.pt", map_location=config.device)
+    checkpoint = torch.load("checkpoints/best_model.pt", map_location=config.device, weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
     print(f"✓ Loaded checkpoint from epoch {checkpoint.get('epoch', '?')}")
-
-    # Load validation data
-    _, val_loader, _ = get_dataloaders(config, grid_mapper)
 
     # Get first batch for analysis
     batch = next(iter(val_loader))
@@ -52,8 +54,16 @@ def diagnose():
         # ============================================================
         # 1. Get ground truth codes
         # ============================================================
-        sem_target = batch['sem_target']  # (B, num_items, 4) with offsets
+        sem_target = batch['sem_target']  # Shape varies: (B, num_items*4) or (B, num_items, 4)
         target_item_ids = batch['sem_target_eval']  # (B,)
+
+        print(f"   sem_target shape: {sem_target.shape}")
+
+        # Reshape if flattened
+        if sem_target.dim() == 2 and sem_target.size(1) % 4 == 0:
+            num_items = sem_target.size(1) // 4
+            sem_target = sem_target.view(B, num_items, 4)
+            print(f"   Reshaped to: {sem_target.shape}")
 
         # Ground truth codes for first item (what model should predict)
         gt_codes_offset = sem_target[:, 0, :]  # (B, 4)
@@ -151,7 +161,7 @@ def diagnose():
             unique_items_per_user.append(unique_items)
 
             gt_item = target_item_ids[i].item()
-            is_hit = (gt_item in predicted_items_i).item()
+            is_hit = (predicted_items_i == gt_item).any().item()
 
             print(f"\n   User {i}:")
             print(f"     Ground truth item: {gt_item}")
@@ -169,7 +179,7 @@ def diagnose():
         # ============================================================
         hits = 0
         for i in range(B):
-            if target_item_ids[i] in predicted_items[i]:
+            if (predicted_items[i] == target_item_ids[i]).any().item():
                 hits += 1
         hit_rate = hits / B
 
@@ -204,8 +214,8 @@ def diagnose():
             semantic_ids = json.load(f)
 
         valid_codes = set()
-        for item_data in semantic_ids['item_to_codes'].values():
-            codes = tuple(item_data['codes'])
+        for codes_list in semantic_ids.values():
+            codes = tuple(codes_list)
             valid_codes.add(codes)
 
         print(f"   Total valid code combinations: {len(valid_codes)}")

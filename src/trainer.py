@@ -23,7 +23,7 @@ class UniGCRTrainer:
         
         # --- Loss Definitions ---
         # GR 任务: 预测下一个 Semantic Code (Cross Entropy)
-        self.gr_criterion = nn.CrossEntropyLoss()
+        self.gr_criterion = nn.CrossEntropyLoss(ignore_index=-100)
         
         # CTR 任务: 联合 Loss
         if config.enable_ctr:
@@ -100,19 +100,10 @@ class UniGCRTrainer:
         """
         self.model.train()
 
-        # Scheduled Sampling: Gradually reduce teacher forcing ratio (CONSERVATIVE)
-        # Epochs 1-10: Full teacher forcing (1.0) - learn correct code space first
-        # Epochs 11-30: Slow linear decay (1.0 → 0.7) - gradual exposure to errors
-        # Epochs 31+: Maintain high TF (0.7) - keep model grounded in correct codes
-        if epoch_idx <= 10:
-            teacher_forcing_ratio = 1.0
-        elif epoch_idx <= 30:
-            # Slow decay from 1.0 to 0.7 over epochs 11-30
-            teacher_forcing_ratio = 1.0 - 0.3 * (epoch_idx - 10) / 20
-        else:
-            teacher_forcing_ratio = 0.7
-
-        # Set the ratio on the model
+        # Full teacher forcing: always use ground-truth codes when conditioning
+        # each layer.  Switch to scheduled sampling once the model learns the
+        # correct code space (set teacher_forcing_ratio < 1.0 when ready).
+        teacher_forcing_ratio = 1.0
         self.model.teacher_forcing_ratio = teacher_forcing_ratio
 
         if is_main_process():
@@ -128,6 +119,7 @@ class UniGCRTrainer:
         total_loss = 0.0
         gr_loss_sum = 0.0
         ctr_loss_sum = 0.0
+        step = 0  # batch counter for debug printing
 
         # 获取 GridMapper (用于 Beam Search 时的 Masking)
         # 注意: DataLoader 可能经过 DistributedSampler 封装，需要通过 dataset 访问
@@ -206,27 +198,32 @@ class UniGCRTrainer:
                     1 + 3 * self.config.sem_id_codebook_size,
                 ]
 
+                # Build position mask from lengths so PAD positions are ignored.
+                # lengths[b] = number of history TOKENS (e.g. 8 = 2 items).
+                # After the item-level shift in data_amazon.py, valid TARGET positions
+                # are 0 .. (num_hist_items - 1), exactly lengths // num_layers positions.
+                lengths_items = batch['lengths'] // self.config.sem_id_layers  # (B,)
+                num_items_dim  = sem_target.size(1)                             # 38
+                pos_idx = torch.arange(num_items_dim, device=self.device).unsqueeze(0)  # (1, 38)
+                valid_mask = pos_idx < lengths_items.unsqueeze(1)               # (B, 38) bool
+
                 # Compute loss for each layer separately
                 loss_gr = 0.0
                 for layer_idx, logits_layer in enumerate(gr_logits):
                     # logits_layer: (B, num_items, vocab_size_for_layer)
-                    # targets_layer: (B, num_items) - WITH offset
-                    targets_layer_offset = sem_target[:, :, layer_idx]
+                    targets_layer_offset = sem_target[:, :, layer_idx]          # (B, num_items)
 
-                    # Remove offset to get raw codes (0-255 for L0/L1/L2, 0-18 for Dedup)
+                    # Remove offset → raw codes (0-255 for L0/L1/L2, 0-18 for Dedup)
                     targets_layer = targets_layer_offset - layer_offsets[layer_idx]
 
-                    # Get vocab size from logits shape (last dimension)
-                    vocab_size = logits_layer.size(-1)
-
-                    # Clamp to valid range [0, vocab_size-1]
-                    targets_layer = torch.clamp(targets_layer, min=0, max=vocab_size - 1)
+                    # Set PAD positions to -100 so CrossEntropyLoss(ignore_index=-100) skips them
+                    targets_layer = torch.where(valid_mask, targets_layer,
+                                                torch.full_like(targets_layer, -100))
 
                     # Flatten for cross entropy
-                    logits_flat = logits_layer.reshape(-1, logits_layer.size(-1))
+                    logits_flat  = logits_layer.reshape(-1, logits_layer.size(-1))
                     targets_flat = targets_layer.reshape(-1)
 
-                    # Compute loss for this layer
                     loss_gr += self.gr_criterion(logits_flat, targets_flat)
 
                 # Average over 4 layers
@@ -234,7 +231,54 @@ class UniGCRTrainer:
 
                 loss += loss_gr
                 gr_loss_sum += loss_gr.item()
-            
+
+            # ── DEBUG: print sample 0 every N batches ──────────────────────
+            debug_every = 200
+            if is_main_process() and self.config.use_semantic_seq and step % debug_every == 0:
+                with torch.no_grad():
+                    b = 0  # inspect sample 0 in the batch
+                    n_layers  = self.config.sem_id_layers
+                    lengths_b = batch['lengths'][b].item()
+                    n_hist    = lengths_b // n_layers   # number of history items
+                    last_pos  = n_hist - 1              # position where eval target is predicted
+
+                    # --- History items (sem_history reshaped) ---
+                    hist_items = batch['sem_history'][b].view(-1, n_layers)  # (38, 4)
+
+                    # --- Ground-truth target at eval position (with offsets) ---
+                    tgt_items = batch['sem_target'][b].view(-1, n_layers)    # (38, 4)
+                    gt_codes_offset = tgt_items[last_pos].tolist()
+
+                    # --- Model prediction at eval position (argmax of logits) ---
+                    # gr_logits: list of 4 tensors each (B, num_items, vocab)
+                    pred_raw = [
+                        gr_logits[li][b, last_pos].argmax().item()
+                        for li in range(n_layers)
+                    ]
+
+                    # --- Reapply offsets to predicted raw codes for comparison ---
+                    layer_offsets_list = [
+                        1,
+                        1 + self.config.sem_id_codebook_size,
+                        1 + 2 * self.config.sem_id_codebook_size,
+                        1 + 3 * self.config.sem_id_codebook_size,
+                    ]
+                    pred_offset = [pred_raw[i] + layer_offsets_list[i] for i in range(n_layers)]
+                    match = (pred_offset == gt_codes_offset)
+
+                    print(f"\n{'─'*60}")
+                    print(f"[DEBUG] Epoch {epoch_idx}  Step {step}  (sample 0)")
+                    print(f"  History items : {n_hist}  (last predict pos = {last_pos})")
+                    for i in range(n_hist):
+                        print(f"    Input [{i}] : {hist_items[i].tolist()}")
+                    print(f"  GT target     : {gt_codes_offset}  (with offsets)")
+                    print(f"  Predicted     : {pred_offset}  (with offsets)")
+                    print(f"  Match         : {'✓ YES' if match else '✗ NO'}")
+                    print(f"  GR loss       : {loss_gr.item():.4f}")
+                    print(f"{'─'*60}\n")
+            step += 1
+            # ── END DEBUG ───────────────────────────────────────────────────
+
             # --- Task B: CTR Prediction (Optional) ---
             loss_ctr_val = 0.0
             if self.config.enable_ctr:
@@ -344,6 +388,12 @@ class UniGCRTrainer:
                     1 + 3 * self.config.sem_id_codebook_size,
                 ]
 
+                # Build position mask (same logic as training)
+                lengths_items = batch['lengths'] // self.config.sem_id_layers  # (B,)
+                num_items_dim  = sem_target.size(1)
+                pos_idx = torch.arange(num_items_dim, device=self.device).unsqueeze(0)
+                valid_mask = pos_idx < lengths_items.unsqueeze(1)               # (B, num_items)
+
                 # Compute loss for each layer separately
                 loss_gr = 0.0
                 for layer_idx, logits_layer in enumerate(gr_logits):
@@ -352,13 +402,11 @@ class UniGCRTrainer:
                     # Remove offset to get raw codes
                     targets_layer = targets_layer_offset - layer_offsets[layer_idx]
 
-                    # Get vocab size from logits shape
-                    vocab_size = logits_layer.size(-1)
+                    # Mask PAD positions with -100 (ignored by criterion)
+                    targets_layer = torch.where(valid_mask, targets_layer,
+                                                torch.full_like(targets_layer, -100))
 
-                    # Clamp to valid range [0, vocab_size-1]
-                    targets_layer = torch.clamp(targets_layer, min=0, max=vocab_size - 1)
-
-                    logits_flat = logits_layer.reshape(-1, logits_layer.size(-1))
+                    logits_flat  = logits_layer.reshape(-1, logits_layer.size(-1))
                     targets_flat = targets_layer.reshape(-1)
                     loss_gr += self.gr_criterion(logits_flat, targets_flat)
 

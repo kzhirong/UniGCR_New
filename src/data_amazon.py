@@ -116,20 +116,49 @@ class AmazonBeautyDataset(Dataset):
             full_seq = seq_codes + tgt_codes
 
             # Track actual length before padding (for variable-length attention)
-            actual_length = len(full_seq) - 1  # Subtract 1 because we'll take [:-1] for input
+            # CRITICAL FIX: Use len(seq_codes) (history only) to ensure clean item boundaries
+            # sem_history will contain full_seq[:-1], which includes partial target tokens
+            # But for item-level extraction, we need to extract from last HISTORY position
+            actual_length = len(seq_codes)
 
             # Truncate/pad to max_seq_len
             max_len = self.config.max_seq_len
             if len(full_seq) > max_len:
+                # Truncate from the left (keep most recent history + target)
                 full_seq = full_seq[-max_len:]
-                actual_length = max_len - 1  # All tokens are valid after truncation
+                # After truncation, recalculate actual_length
+                # The last 4 tokens are target, so history length = max_len - 4
+                actual_length = max_len - len(tgt_codes)
             else:
-                full_seq = [0] * (max_len - len(full_seq)) + full_seq
+                # CRITICAL FIX: Use RIGHT-PADDING instead of LEFT-PADDING
+                # HSTU expects valid items at the start, not the end!
+                full_seq = full_seq + [0] * (max_len - len(full_seq))
 
-            # Input: all tokens except last
-            # Label: all tokens except first (shifted by 1)
+            # Input: all tokens except last (38 items × 4 tokens = 152 tokens)
+            # Label: shift by 1 ITEM (4 tokens), not 1 token
+            #   full_seq[:-1]              = 152 tokens (positions 0..151)
+            #   full_seq[num_layers:-1]    = 148 tokens (positions 4..151, drops first item)
+            #   + [0] * num_layers         = pads 4 zeros at end → 152 tokens total
+            #
+            # Result after reshape to (38, 4):
+            #   sem_history[i] = Item i
+            #   sem_target[i]  = Item i+1  (next item, which HSTU causally cannot see)
+            num_layers = self.config.sem_id_layers
             output['sem_history'] = torch.tensor(full_seq[:-1], dtype=torch.long)
-            output['sem_target'] = torch.tensor(full_seq[1:], dtype=torch.long)
+
+            target_tokens = full_seq[num_layers:-1] + [0] * num_layers  # 152 tokens, with offsets
+            output['sem_target'] = torch.tensor(target_tokens, dtype=torch.long)
+
+            # target_codes_seq: raw codes (NO offsets) for teacher forcing inside
+            # predict_codes_autoregressive.  Shape: (num_items, 4).
+            # Layer starts are the offsets applied by GridMapper (e.g. [1, 257, 513, 769]).
+            layer_starts = torch.tensor(
+                [self.grid_mapper.layer_ranges[i][0] for i in range(num_layers)],
+                dtype=torch.long
+            )  # (4,)
+            target_raw = torch.tensor(target_tokens, dtype=torch.long).view(-1, num_layers)  # (38, 4)
+            target_raw = torch.clamp(target_raw - layer_starts.unsqueeze(0), min=0)          # (38, 4)
+            output['target_codes_seq'] = target_raw   # model reads this for teacher forcing
 
             # Lengths: actual (non-padded) sequence length in tokens
             # Model uses this for variable-length masking in HSTU
