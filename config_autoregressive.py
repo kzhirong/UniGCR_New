@@ -15,7 +15,7 @@ def get_autoregressive_config():
     conf = UniGCRConfig()
 
     # Memory optimizations
-    conf.batch_size = 32  # AMP halved memory usage; safe to double from 16
+    conf.batch_size = 256  # Large batch fine: embed_dim=64 model is memory-light; AMP active
     conf.max_seq_len = 41  # 40 tokens = 10 items (reduced from 38 items)
                            # Formula: (max_seq_len - 1) must be divisible by 4
                            # 41 - 1 = 40, and 40 / 4 = 10 items ✓

@@ -124,11 +124,21 @@ class AmazonBeautyDataset(Dataset):
             # Truncate/pad to max_seq_len
             max_len = self.config.max_seq_len
             if len(full_seq) > max_len:
-                # Truncate from the left (keep most recent history + target)
-                full_seq = full_seq[-max_len:]
-                # After truncation, recalculate actual_length
-                # The last 4 tokens are target, so history length = max_len - 4
-                actual_length = max_len - len(tgt_codes)
+                # Truncate from the left (keep most recent history + target).
+                # IMPORTANT: always remove whole items (round UP to nearest num_layers)
+                # so the sequence stays item-aligned.  A non-aligned cut leaves a partial
+                # item's D-code at position 0, causing view(-1, n_layers) to misalign and
+                # the debug / training to see D-range codes in the L0 column.
+                n_l = self.config.sem_id_layers
+                tokens_to_remove = len(full_seq) - max_len
+                items_to_remove  = (tokens_to_remove + n_l - 1) // n_l  # ceil division
+                aligned_remove   = items_to_remove * n_l
+                full_seq = full_seq[aligned_remove:]
+                actual_length = max(0, len(seq_codes) - aligned_remove)
+                # aligned_remove may be slightly more than tokens_to_remove,
+                # so full_seq may now be 1-3 tokens shorter than max_len → pad end
+                if len(full_seq) < max_len:
+                    full_seq = full_seq + [0] * (max_len - len(full_seq))
             else:
                 # CRITICAL FIX: Use RIGHT-PADDING instead of LEFT-PADDING
                 # HSTU expects valid items at the start, not the end!
