@@ -80,6 +80,30 @@ class UniGCRTrainer:
 
             print(f"[Trainer] Device: {self.device}, Learning rate: {lr}")
 
+        # ── Automatic Mixed Precision (AMP) ──────────────────────────────────
+        # DeepSpeed handles its own AMP (fp16/bf16 via ds_config).
+        # For regular PyTorch path we set up autocast + GradScaler here.
+        if not self.use_deepspeed and torch.cuda.is_available():
+            if torch.cuda.is_bf16_supported():
+                # BF16: no loss scaling needed (no underflow risk), ~1.5-2× faster
+                self.amp_dtype = torch.bfloat16
+                self.amp_scaler = None
+                print("[Trainer] Mixed precision: bfloat16 (no scaler needed)")
+            else:
+                # FP16: requires GradScaler to avoid underflow
+                self.amp_dtype = torch.float16
+                self.amp_scaler = torch.amp.GradScaler('cuda')
+                print("[Trainer] Mixed precision: float16 + GradScaler")
+            self.use_amp = True
+        else:
+            self.use_amp = False
+            self.amp_dtype = torch.float32
+            self.amp_scaler = None
+            if self.use_deepspeed:
+                print("[Trainer] AMP: managed by DeepSpeed config")
+            else:
+                print("[Trainer] AMP: disabled (no CUDA)")
+
     def calculate_ctr_loss(self, ctr_logits, ctr_labels):
         """
         计算 CTR 任务的混合 Loss (InfoNCE + BCE)
@@ -100,10 +124,25 @@ class UniGCRTrainer:
         """
         self.model.train()
 
-        # Full teacher forcing: always use ground-truth codes when conditioning
-        # each layer.  Switch to scheduled sampling once the model learns the
-        # correct code space (set teacher_forcing_ratio < 1.0 when ready).
-        teacher_forcing_ratio = 1.0
+        # Scheduled sampling:
+        #   Epochs  1-10 : TF = 1.0  (full teacher forcing — model learns correct code space)
+        #   Epochs 11-30 : TF linearly 1.0 → 0.5  (reduce exposure bias gradually)
+        #   Epochs 31+   : TF = 0.5  (steady mix so model handles its own errors)
+        #
+        # WHY this is needed:
+        #   With TF=1.0, L1/L2/D are conditioned on TRUE L0 during training.
+        #   At inference, L0 is imperfect (e.g. biased to the most-common code).
+        #   L1/L2/D have never seen a wrong L0, so their inference predictions collapse.
+        #   Gradually exposing them to the model's own L0 predictions during training
+        #   (a) forces L1/L2/D to be robust to imperfect L0
+        #   (b) creates a gradient signal that pushes L0 to be more discriminative
+        if epoch_idx <= 10:
+            teacher_forcing_ratio = 1.0
+        elif epoch_idx <= 30:
+            teacher_forcing_ratio = 1.0 - 0.5 * (epoch_idx - 10) / 20  # 1.0 → 0.5
+        else:
+            teacher_forcing_ratio = 0.5
+
         self.model.teacher_forcing_ratio = teacher_forcing_ratio
 
         if is_main_process():
@@ -164,72 +203,98 @@ class UniGCRTrainer:
                 # Add to batch for model access
                 batch['target_codes_seq'] = target_codes_seq
 
-            # 3. Forward Pass (Shared Backbone & GR Head with Autoregressive Prediction)
-            # u: User State (B, D)
-            # gr_logits: List of 4 tensors (L0, L1, L2, Dedup) with different vocab sizes
-            u, gr_logits, _ = self.model(batch)
-
+            # 3. Forward + Loss
+            # torch.autocast wraps the entire forward+loss section so matrix multiplications
+            # and activations run in fp16/bf16 while accumulators stay in fp32.
+            # When use_amp=False (CPU or DeepSpeed) the context is a no-op.
             loss = 0.0
+            loss_gr = torch.tensor(0.0, device=self.device)   # sentinel (in case GR disabled)
+            loss_ctr_val = 0.0
 
-            # --- Task A: Generative Retrieval (GR) ---
+            with torch.autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.use_amp):
+
+                # ── Forward Pass ────────────────────────────────────────────
+                # u: User State (B, D)
+                # gr_logits: list of 4 tensors [L0, L1, L2, D] with different vocab sizes
+                u, gr_logits, _ = self.model(batch)
+
+                # ── Task A: Generative Retrieval (GR) ───────────────────────
+                if self.config.use_semantic_seq:
+                    # gr_logits shapes:
+                    #   L0/L1/L2 : (B, num_items, 256)
+                    #   Dedup    : (B, num_items, 19)
+                    # sem_target : (B, num_items*4) or (B, num_items, 4) — WITH offsets
+
+                    # Reshape targets to (B, num_items, 4) if flattened
+                    sem_target = batch['sem_target']
+                    B = sem_target.size(0)
+                    if sem_target.dim() == 2 and sem_target.size(1) % self.config.sem_id_layers == 0:
+                        num_items = sem_target.size(1) // self.config.sem_id_layers
+                        sem_target = sem_target.view(B, num_items, self.config.sem_id_layers)
+
+                    # Layer offsets:  L0:1, L1:257, L2:513, Dedup:769
+                    layer_offsets = [
+                        1,
+                        1 + self.config.sem_id_codebook_size,
+                        1 + 2 * self.config.sem_id_codebook_size,
+                        1 + 3 * self.config.sem_id_codebook_size,
+                    ]
+
+                    # Position mask: ignore PAD positions beyond actual history length.
+                    # lengths[b] = number of history TOKENS (e.g. 8 = 2 items × 4 layers).
+                    lengths_items = batch['lengths'] // self.config.sem_id_layers  # (B,)
+                    num_items_dim  = sem_target.size(1)                             # 38
+                    pos_idx = torch.arange(num_items_dim, device=self.device).unsqueeze(0)  # (1, 38)
+                    valid_mask = pos_idx < lengths_items.unsqueeze(1)               # (B, 38) bool
+
+                    # ── One-time diagnostic (epoch 1, step 0) ──────────────
+                    if epoch_idx == 1 and step == 0 and is_main_process():
+                        print(f"\n[DIAG] sem_target shape: {sem_target.shape}")
+                        print(f"[DIAG] lengths_items range: [{lengths_items.min().item()}, {lengths_items.max().item()}]")
+                        for _li in range(self.config.sem_id_layers):
+                            _raw = sem_target[:, :, _li] - layer_offsets[_li]
+                            _vld = valid_mask
+                            print(f"[DIAG] Layer {_li}: offset={layer_offsets[_li]}, "
+                                  f"raw valid range=[{_raw[_vld].min().item()}, {_raw[_vld].max().item()}]"
+                                  if _vld.any() else f"[DIAG] Layer {_li}: no valid positions!")
+                    # ── End diagnostic ─────────────────────────────────────
+
+                    # Compute cross-entropy loss for each layer separately
+                    loss_gr = 0.0
+                    for layer_idx, logits_layer in enumerate(gr_logits):
+                        targets_layer_offset = sem_target[:, :, layer_idx]      # (B, num_items)
+                        # Remove offset → raw codes (0-255 or 0-18)
+                        targets_layer = targets_layer_offset - layer_offsets[layer_idx]
+
+                        # Three conditions make a position invalid → set to -100 (ignored):
+                        #   1. Beyond actual history length  (valid_mask=False)
+                        #   2. Raw code is negative          (PAD token 0 after offset removal)
+                        #   3. Raw code >= vocab_size        (config/data mismatch)
+                        vocab_size = logits_layer.size(-1)
+                        valid_targets = valid_mask & (targets_layer >= 0) & (targets_layer < vocab_size)
+                        targets_layer = torch.where(valid_targets, targets_layer,
+                                                    torch.full_like(targets_layer, -100))
+
+                        logits_flat  = logits_layer.reshape(-1, logits_layer.size(-1))
+                        targets_flat = targets_layer.reshape(-1)
+                        loss_gr += self.gr_criterion(logits_flat, targets_flat)
+
+                    loss_gr = loss_gr / self.config.sem_id_layers   # average over 4 layers
+                    loss += loss_gr
+
+                # ── Task B: CTR Prediction (Optional) ───────────────────────
+                if self.config.enable_ctr:
+                    pos_codes = batch['ctr_pos_codes']
+                    ctr_logits, ctr_labels = self.model.predict_ctr(
+                        u, batch, pos_codes, self.device, grid_mapper
+                    )
+                    loss_ctr = self.calculate_ctr_loss(ctr_logits, ctr_labels)
+                    loss += loss_ctr
+                    loss_ctr_val = loss_ctr.item()
+                    ctr_loss_sum += loss_ctr_val
+
+            # autocast context closed — tensors already computed, safe to read outside
             if self.config.use_semantic_seq:
-                # gr_logits: List of 4 tensors
-                # - logits_L0: (B, num_items, 256)  - predicting raw codes 0-255
-                # - logits_L1: (B, num_items, 256)  - predicting raw codes 0-255
-                # - logits_L2: (B, num_items, 256)  - predicting raw codes 0-255
-                # - logits_Dedup: (B, num_items, 19) - predicting raw codes 0-18
-                # sem_target: (B, num_items*4) or (B, num_items, 4) - targets WITH offsets
-
-                # Reshape targets to (B, num_items, 4) if flattened
-                sem_target = batch['sem_target']
-                B = sem_target.size(0)
-
-                # If targets are flattened (B, num_items*4), reshape to (B, num_items, 4)
-                if sem_target.dim() == 2 and sem_target.size(1) % self.config.sem_id_layers == 0:
-                    num_items = sem_target.size(1) // self.config.sem_id_layers
-                    sem_target = sem_target.view(B, num_items, self.config.sem_id_layers)
-
-                # Layer offsets (same as in model.py):
-                # L0: offset 1, L1: offset 257, L2: offset 513, Dedup: offset 769
-                layer_offsets = [
-                    1,
-                    1 + self.config.sem_id_codebook_size,
-                    1 + 2 * self.config.sem_id_codebook_size,
-                    1 + 3 * self.config.sem_id_codebook_size,
-                ]
-
-                # Build position mask from lengths so PAD positions are ignored.
-                # lengths[b] = number of history TOKENS (e.g. 8 = 2 items).
-                # After the item-level shift in data_amazon.py, valid TARGET positions
-                # are 0 .. (num_hist_items - 1), exactly lengths // num_layers positions.
-                lengths_items = batch['lengths'] // self.config.sem_id_layers  # (B,)
-                num_items_dim  = sem_target.size(1)                             # 38
-                pos_idx = torch.arange(num_items_dim, device=self.device).unsqueeze(0)  # (1, 38)
-                valid_mask = pos_idx < lengths_items.unsqueeze(1)               # (B, 38) bool
-
-                # Compute loss for each layer separately
-                loss_gr = 0.0
-                for layer_idx, logits_layer in enumerate(gr_logits):
-                    # logits_layer: (B, num_items, vocab_size_for_layer)
-                    targets_layer_offset = sem_target[:, :, layer_idx]          # (B, num_items)
-
-                    # Remove offset → raw codes (0-255 for L0/L1/L2, 0-18 for Dedup)
-                    targets_layer = targets_layer_offset - layer_offsets[layer_idx]
-
-                    # Set PAD positions to -100 so CrossEntropyLoss(ignore_index=-100) skips them
-                    targets_layer = torch.where(valid_mask, targets_layer,
-                                                torch.full_like(targets_layer, -100))
-
-                    # Flatten for cross entropy
-                    logits_flat  = logits_layer.reshape(-1, logits_layer.size(-1))
-                    targets_flat = targets_layer.reshape(-1)
-
-                    loss_gr += self.gr_criterion(logits_flat, targets_flat)
-
-                # Average over 4 layers
-                loss_gr = loss_gr / self.config.sem_id_layers
-
-                loss += loss_gr
                 gr_loss_sum += loss_gr.item()
 
             # ── DEBUG: print sample 0 every N batches ──────────────────────
@@ -242,68 +307,77 @@ class UniGCRTrainer:
                     n_hist    = lengths_b // n_layers   # number of history items
                     last_pos  = n_hist - 1              # position where eval target is predicted
 
-                    # --- History items (sem_history reshaped) ---
-                    hist_items = batch['sem_history'][b].view(-1, n_layers)  # (38, 4)
-
-                    # --- Ground-truth target at eval position (with offsets) ---
-                    tgt_items = batch['sem_target'][b].view(-1, n_layers)    # (38, 4)
-                    gt_codes_offset = tgt_items[last_pos].tolist()
-
-                    # --- Model prediction at eval position (argmax of logits) ---
-                    # gr_logits: list of 4 tensors each (B, num_items, vocab)
-                    pred_raw = [
-                        gr_logits[li][b, last_pos].argmax().item()
-                        for li in range(n_layers)
-                    ]
-
-                    # --- Reapply offsets to predicted raw codes for comparison ---
+                    # Layer offsets from config (hardcoded)
                     layer_offsets_list = [
                         1,
                         1 + self.config.sem_id_codebook_size,
                         1 + 2 * self.config.sem_id_codebook_size,
                         1 + 3 * self.config.sem_id_codebook_size,
                     ]
+                    layer_names = ['L0', 'L1', 'L2', 'D']
+
+                    # Check if GridMapper offsets match the hardcoded config offsets.
+                    # Mismatch = Colab data has different layer order from what model expects.
+                    gm_ranges = [grid_mapper.layer_ranges[i][0] for i in range(n_layers)]
+                    offset_mismatch = (gm_ranges != layer_offsets_list)
+
+                    # --- History items (sem_history reshaped) ---
+                    hist_items = batch['sem_history'][b].view(-1, n_layers)  # (38, 4)
+
+                    # --- Ground-truth target at eval position (with offsets) ---
+                    tgt_items = batch['sem_target'][b].view(-1, n_layers)    # (38, 4)
+                    gt_codes_offset = tgt_items[last_pos].tolist()
+                    gt_raw = [gt_codes_offset[i] - layer_offsets_list[i] for i in range(n_layers)]
+
+                    # --- Model prediction at eval position (argmax of logits) ---
+                    pred_raw = [
+                        gr_logits[li][b, last_pos].argmax().item()
+                        for li in range(n_layers)
+                    ]
                     pred_offset = [pred_raw[i] + layer_offsets_list[i] for i in range(n_layers)]
                     match = (pred_offset == gt_codes_offset)
 
+                    # --- Check layer ordering of first input item (sanity check) ---
+                    first_item = hist_items[0].tolist()
+                    expected_ranges = [(layer_offsets_list[i], layer_offsets_list[i] + (
+                        self.config.sem_id_codebook_size if i < n_layers-1 else self.config.sem_id_dedup_size
+                    )) for i in range(n_layers)]
+                    layer_ok = [expected_ranges[i][0] <= first_item[i] < expected_ranges[i][1]
+                                for i in range(n_layers)]
+
                     print(f"\n{'─'*60}")
-                    print(f"[DEBUG] Epoch {epoch_idx}  Step {step}  (sample 0)")
+                    print(f"[DEBUG] Epoch {epoch_idx}  Step {step}  (sample 0, TF={teacher_forcing_ratio:.2f})")
+                    if offset_mismatch:
+                        print(f"  ⚠ OFFSET MISMATCH: GridMapper={gm_ranges} vs config={layer_offsets_list}")
+                        print(f"    → Data layer order may differ from model expectation!")
+                    if not all(layer_ok):
+                        print(f"  ⚠ LAYER ORDER CHECK FAILED on first item {first_item}")
+                        print(f"    Expected: {[f'{layer_names[i]}∈[{expected_ranges[i][0]},{expected_ranges[i][1]})' for i in range(n_layers)]}")
                     print(f"  History items : {n_hist}  (last predict pos = {last_pos})")
-                    for i in range(n_hist):
-                        print(f"    Input [{i}] : {hist_items[i].tolist()}")
-                    print(f"  GT target     : {gt_codes_offset}  (with offsets)")
-                    print(f"  Predicted     : {pred_offset}  (with offsets)")
+                    print(f"  Last input    : {hist_items[last_pos].tolist()}  "
+                          f"({', '.join(f'{layer_names[i]}={hist_items[last_pos][i].item()}' for i in range(n_layers))})")
+                    print(f"  GT target     : {gt_codes_offset}  (raw: {gt_raw})")
+                    print(f"  Predicted     : {pred_offset}  (raw: {pred_raw})")
+                    print(f"  Per-layer     : " + "  ".join(
+                        f"{layer_names[i]}: pred={pred_raw[i]} gt={gt_raw[i]} {'✓' if pred_raw[i]==gt_raw[i] else '✗'}"
+                        for i in range(n_layers)))
                     print(f"  Match         : {'✓ YES' if match else '✗ NO'}")
                     print(f"  GR loss       : {loss_gr.item():.4f}")
                     print(f"{'─'*60}\n")
             step += 1
             # ── END DEBUG ───────────────────────────────────────────────────
 
-            # --- Task B: CTR Prediction (Optional) ---
-            loss_ctr_val = 0.0
-            if self.config.enable_ctr:
-                # 正样本: 用户实际点击的 Item 的 Semantic Codes
-                # shape: (B, Layers)
-                pos_codes = batch['ctr_pos_codes']
-
-                # 调用 predict_ctr
-                # 注意: 内部包含 Beam Search 逻辑，需要传入 batch (获取 History) 和 mapper
-                ctr_logits, ctr_labels = self.model.predict_ctr(
-                    u, batch, pos_codes, self.device, grid_mapper
-                )
-
-                # 计算 Loss
-                loss_ctr = self.calculate_ctr_loss(ctr_logits, ctr_labels)
-
-                loss += loss_ctr
-                loss_ctr_val = loss_ctr.item()
-                ctr_loss_sum += loss_ctr_val
-
-            # 3. Backward & Step
+            # 4. Backward & Optimizer Step
             if self.use_deepspeed:
                 self.model_engine.backward(loss)
                 self.model_engine.step()
+            elif self.amp_scaler is not None:
+                # FP16 path: scale loss to prevent gradient underflow
+                self.amp_scaler.scale(loss).backward()
+                self.amp_scaler.step(self.optimizer)
+                self.amp_scaler.update()
             else:
+                # BF16 or no-AMP path: standard backward
                 loss.backward()
                 self.optimizer.step()
             
@@ -402,8 +476,11 @@ class UniGCRTrainer:
                     # Remove offset to get raw codes
                     targets_layer = targets_layer_offset - layer_offsets[layer_idx]
 
-                    # Mask PAD positions with -100 (ignored by criterion)
-                    targets_layer = torch.where(valid_mask, targets_layer,
+                    # Mask PAD/invalid positions with -100 (ignored by criterion).
+                    # Same three-way guard as training: position, sign, and vocab bounds.
+                    vocab_size = logits_layer.size(-1)
+                    valid_targets = valid_mask & (targets_layer >= 0) & (targets_layer < vocab_size)
+                    targets_layer = torch.where(valid_targets, targets_layer,
                                                 torch.full_like(targets_layer, -100))
 
                     logits_flat  = logits_layer.reshape(-1, logits_layer.size(-1))
