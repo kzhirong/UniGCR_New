@@ -35,11 +35,11 @@ class UniGCRConfig:
     num_feature_size: int = 5
     
     # --- [模型参数] ---
-    embed_dim: int = 128
+    embed_dim: int = 256
     max_seq_len: int = 153  # Must be: (max_seq_len - 1) % 4 == 0 for 4-layer semantic IDs
                              # 153 - 1 = 152, and 152 / 4 = 38 items ✓
-    hstu_layers: int = 3
-    hstu_heads: int = 2
+    hstu_layers: int = 4
+    hstu_heads: int = 4
     dropout: float = 0.1
     attn_alpha: float = 1.0
 
@@ -53,10 +53,10 @@ class UniGCRConfig:
     hstu_enable_rel_bias: bool = True          # Enable relative attention bias
     
     # --- [训练参数] ---
-    patience: int = 30  # Increased to allow conservative scheduled sampling (epochs 1-30)
+    patience: int = 50  # Allow model to climb out of TF-transition plateau
     batch_size: int = 256
     lr: float = 1e-3
-    epochs: int = 50
+    epochs: int = 100
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     seed: int = 42
     

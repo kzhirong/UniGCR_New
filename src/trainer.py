@@ -23,7 +23,9 @@ class UniGCRTrainer:
         
         # --- Loss Definitions ---
         # GR 任务: 预测下一个 Semantic Code (Cross Entropy)
-        self.gr_criterion = nn.CrossEntropyLoss(ignore_index=-100)
+        # label_smoothing=0.1: softens targets from hard 0/1 to (0.1/V, ..., 0.9, ..., 0.1/V).
+        # This improves calibration and reduces overconfident wrong predictions in L0-L3.
+        self.gr_criterion = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=0.1)
         
         # CTR 任务: 联合 Loss
         if config.enable_ctr:
@@ -73,7 +75,8 @@ class UniGCRTrainer:
 
             # Create optimizer
             lr = getattr(config, 'lr', getattr(args, 'learning_rate', 1e-4))
-            self.optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+            # weight_decay=0.001: light L2 regularisation; 0.01 was too strong and hurt Hit@10
+            self.optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.001)
 
             # Cosine LR decay: warm lr → 1e-5 over all epochs.
             # This prevents training from stalling at a flat plateau.
@@ -134,19 +137,21 @@ class UniGCRTrainer:
         self.model.train()
 
         # Scheduled sampling:
-        #   Epochs  1-10 : TF = 1.0  (full teacher forcing — model learns correct code space)
-        #   Epochs 11-40 : TF linearly 1.0 → 0.1  (reduce exposure bias while keeping a small
-        #                  ground-truth signal so L1/L2 don't cascade-collapse on wrong L0)
-        #   Epochs 41+   : TF = 0.1  (90% self-prediction; 10% ground-truth prevents L1 bias)
+        #   Epochs  1-20 : TF = 1.0  (full teacher forcing — model fully learns the code space
+        #                  before any self-prediction pressure is applied)
+        #   Epochs 21-80 : TF linearly 1.0 → 0.1  (60-epoch transition; gradual exposure bias
+        #                  reduction gives the model time to adapt without cascade collapse)
+        #   Epochs 81+   : TF = 0.1  (floor prevents L1 cascade collapse at full auto-regressive)
         #
-        # WHY 0.1 floor instead of 0.0:
-        #   At TF=0.0, L0 is almost always wrong early → L1 always sees OOD L0 → L1 collapses
-        #   to its own modal codes (cascading bias).  Keeping 10% true L0 conditioning lets L1
-        #   occasionally reinforce the correct P(L1|true L0, history) distribution.
-        if epoch_idx <= 10:
+        # WHY slow schedule (was 10-epoch warmup / 30-epoch decay):
+        #   Previous run peaked at epoch 13 (TF=0.9) and degraded as TF dropped quickly.
+        #   Model never had enough time at high TF to learn robust L0→item mapping.
+        #   Doubling warmup (→20) and tripling transition (→60) lets the model stabilise
+        #   at each TF level before the next step of self-prediction is introduced.
+        if epoch_idx <= 20:
             teacher_forcing_ratio = 1.0
-        elif epoch_idx <= 40:
-            teacher_forcing_ratio = max(0.1, 1.0 - (epoch_idx - 10) / 30)  # 1.0 → 0.1 over 30 epochs
+        elif epoch_idx <= 80:
+            teacher_forcing_ratio = max(0.1, 1.0 - (epoch_idx - 20) / 60)  # 1.0 → 0.1 over 60 epochs
         else:
             teacher_forcing_ratio = 0.1
 
