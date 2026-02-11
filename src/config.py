@@ -53,7 +53,7 @@ class UniGCRConfig:
     hstu_enable_rel_bias: bool = True          # Enable relative attention bias
     
     # --- [训练参数] ---
-    patience: int = 50  # Allow model to climb out of TF-transition plateau
+    patience: int = 100  # Effectively run all epochs — let LR decay (→ 1e-5) do the work
     batch_size: int = 256
     lr: float = 1e-3
     epochs: int = 100

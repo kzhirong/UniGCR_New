@@ -279,6 +279,26 @@ class UniGCRModel(nn.Module):
         logits_list = []
         sampled_codes = []
 
+        # ── Per-sample scheduled sampling mask ───────────────────────────────────
+        # FIX: The old code called torch.rand(1) once per layer, producing a single
+        # scalar applied to the whole batch of B samples — so an entire batch was
+        # either fully teacher-forced or fully autoregressive, not a proper per-sample
+        # mix.  Two bugs fixed here:
+        #
+        #   Bug 1 (per-batch → per-sample): torch.rand(B) gives each sample its own
+        #   independent coin flip, so ~TF% of SAMPLES use GT context every batch.
+        #   This gives stable, low-variance gradient signal at every step.
+        #
+        #   Bug 2 (cascade consistency): the old code flipped independently for each
+        #   of the 4 layers, so a sample could get L0=GT, L1=pred(given GT_L0),
+        #   L2=GT — an incoherent mixed chain.  Now a single mask is shared across
+        #   all 4 layers: if sample b is TF, ALL its layers use GT context; if AR,
+        #   ALL use the model's own predictions, maintaining a valid autoregressive chain.
+        if training and target_codes is not None:
+            use_tf = torch.rand(u.size(0), device=u.device) < teacher_forcing_ratio  # (B,) bool
+        else:
+            use_tf = None  # Inference: always use model predictions (greedy / beam)
+
         # ============================================================
         # Layer 0: Predict L0 (unconditional, only depends on user state)
         # ============================================================
@@ -286,22 +306,16 @@ class UniGCRModel(nn.Module):
         logits_L0 = self.gr_head_L0(context)  # (B, 256)
         logits_list.append(logits_L0)
 
-        # Get code for L0 (scheduled sampling: mix of teacher forcing and model predictions)
-        if training and target_codes is not None:
-            # Scheduled sampling: randomly choose between ground truth and prediction
-            use_teacher_forcing = torch.rand(1).item() < teacher_forcing_ratio
-            if use_teacher_forcing:
-                code_L0 = target_codes[:, 0]  # Teacher forcing: use ground truth
-            else:
-                code_L0 = torch.argmax(logits_L0, dim=1)  # Use model prediction
+        # Per-sample scheduled sampling: ~TF% of samples use GT, rest use prediction
+        if use_tf is not None:
+            code_L0 = torch.where(use_tf, target_codes[:, 0], torch.argmax(logits_L0, dim=1))
         else:
-            code_L0 = torch.argmax(logits_L0, dim=1)  # Greedy sampling at inference
+            code_L0 = torch.argmax(logits_L0, dim=1)  # Greedy at inference
         sampled_codes.append(code_L0)
 
         # ============================================================
         # Layer 1: Predict L1 conditioned on L0
         # ============================================================
-        # Embed L0 code and combine with user state
         # IMPORTANT: Clamp code to valid range before embedding (handle -100 padding)
         code_L0_for_embed = torch.clamp(code_L0, min=0, max=255)
         emb_L0 = self.input_layer.sem_emb_layers[0](code_L0_for_embed)  # (B, D)
@@ -311,13 +325,9 @@ class UniGCRModel(nn.Module):
         logits_L1 = self.gr_head_L1(context)  # (B, 256)
         logits_list.append(logits_L1)
 
-        # Scheduled sampling for L1
-        if training and target_codes is not None:
-            use_teacher_forcing = torch.rand(1).item() < teacher_forcing_ratio
-            if use_teacher_forcing:
-                code_L1 = target_codes[:, 1]
-            else:
-                code_L1 = torch.argmax(logits_L1, dim=1)
+        # Same use_tf mask → cascade consistency maintained
+        if use_tf is not None:
+            code_L1 = torch.where(use_tf, target_codes[:, 1], torch.argmax(logits_L1, dim=1))
         else:
             code_L1 = torch.argmax(logits_L1, dim=1)
         sampled_codes.append(code_L1)
@@ -334,13 +344,9 @@ class UniGCRModel(nn.Module):
         logits_L2 = self.gr_head_L2(context)  # (B, 256)
         logits_list.append(logits_L2)
 
-        # Scheduled sampling for L2
-        if training and target_codes is not None:
-            use_teacher_forcing = torch.rand(1).item() < teacher_forcing_ratio
-            if use_teacher_forcing:
-                code_L2 = target_codes[:, 2]
-            else:
-                code_L2 = torch.argmax(logits_L2, dim=1)
+        # Same use_tf mask → cascade consistency maintained
+        if use_tf is not None:
+            code_L2 = torch.where(use_tf, target_codes[:, 2], torch.argmax(logits_L2, dim=1))
         else:
             code_L2 = torch.argmax(logits_L2, dim=1)
         sampled_codes.append(code_L2)
@@ -357,13 +363,9 @@ class UniGCRModel(nn.Module):
         logits_Dedup = self.gr_head_Dedup(context)  # (B, 19)
         logits_list.append(logits_Dedup)
 
-        # Scheduled sampling for Dedup
-        if training and target_codes is not None:
-            use_teacher_forcing = torch.rand(1).item() < teacher_forcing_ratio
-            if use_teacher_forcing:
-                code_Dedup = target_codes[:, 3]
-            else:
-                code_Dedup = torch.argmax(logits_Dedup, dim=1)
+        # Same use_tf mask → cascade consistency maintained
+        if use_tf is not None:
+            code_Dedup = torch.where(use_tf, target_codes[:, 3], torch.argmax(logits_Dedup, dim=1))
         else:
             code_Dedup = torch.argmax(logits_Dedup, dim=1)
         sampled_codes.append(code_Dedup)
