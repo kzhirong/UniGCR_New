@@ -73,7 +73,7 @@ class UniGCRTrainer:
 
             # Create optimizer
             lr = getattr(config, 'lr', getattr(args, 'learning_rate', 1e-4))
-            self.optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+            self.optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
 
             # Cosine LR decay: warm lr → 1e-5 over all epochs.
             # This prevents training from stalling at a flat plateau.
@@ -624,9 +624,9 @@ class UniGCRTrainer:
             mode = 'min'
             best_val = float('inf')
         else:
-            monitor_metric = 'val_gr_loss'
-            mode = 'min'
-            best_val = float('inf')
+            monitor_metric = 'Hit@10'
+            mode = 'max'
+            best_val = 0.0
             
         patience_counter = 0
         

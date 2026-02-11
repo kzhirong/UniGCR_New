@@ -116,7 +116,14 @@ def main():
     )
     
     if is_main_process():
+        num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print("Model & Trainer Initialized.")
+        print(f"  embed_dim   : {conf.embed_dim}")
+        print(f"  hstu_layers : {conf.hstu_layers}")
+        print(f"  hstu_heads  : {conf.hstu_heads}")
+        print(f"  max_seq_len : {conf.max_seq_len} ({(conf.max_seq_len-1)//conf.sem_id_layers} items)")
+        print(f"  batch_size  : {conf.batch_size}")
+        print(f"  parameters  : {num_params:,}")
 
     # 7. Check if eval-only mode
     if args.eval_only:
