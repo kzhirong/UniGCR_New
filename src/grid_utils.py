@@ -55,6 +55,15 @@ class GridMapper:
         if self.reverse_mapping:
             self._build_vectorized_lookup()
 
+        # Build prefix trie for constrained beam search.
+        # Trie structure: {L0_raw: {L1_raw: {L2_raw: {D_raw: item_id}}}}
+        # All keys are raw codes (NO offsets). Leaves are integer item IDs.
+        # This lets beam search restrict expansion at each layer to only codes
+        # that appear in at least one real item — every final beam is a valid item.
+        self.trie = self._build_trie()
+        print(f"[GridMapper] Built prefix trie: {len(self.trie)} L0 roots, "
+              f"{len(self.reverse_mapping)} total items")
+
     def _auto_detect_structure(self):
         """
         Auto-detect number of layers and codebook size per layer from actual data
@@ -84,6 +93,30 @@ class GridMapper:
         codebook_sizes = [max_val + 1 for max_val in max_values]
 
         return num_layers, codebook_sizes
+
+    def _build_trie(self):
+        """
+        Build a prefix trie from raw item codes for constrained beam search.
+
+        Structure: {L0_raw: {L1_raw: {L2_raw: {D_raw: item_id, ...}, ...}, ...}, ...}
+
+        Keys at every level are raw integer codes (no layer offsets applied).
+        Leaf values are integer item IDs from self.mapping.
+
+        During constrained beam search, at each layer we look up the current beam's
+        partial code path in the trie and only allow expansion into codes that exist
+        as children of that node.  This guarantees every completed beam maps to a
+        real catalog item — no nearest-neighbour fallback required.
+        """
+        trie = {}
+        for item_id, codes in self.mapping.items():
+            node = trie
+            for code in codes[:-1]:          # descend through all layers except the last
+                if code not in node:
+                    node[code] = {}
+                node = node[code]
+            node[codes[-1]] = item_id        # leaf: map final code to item_id
+        return trie
 
     def _load_mapping(self, path):
         if not os.path.exists(path):

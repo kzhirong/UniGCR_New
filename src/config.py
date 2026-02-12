@@ -35,12 +35,12 @@ class UniGCRConfig:
     num_feature_size: int = 5
     
     # --- [模型参数] ---
-    embed_dim: int = 128
+    embed_dim: int = 256
     max_seq_len: int = 153  # Must be: (max_seq_len - 1) % 4 == 0 for 4-layer semantic IDs
                              # 153 - 1 = 152, and 152 / 4 = 38 items ✓
-    hstu_layers: int = 3
+    hstu_layers: int = 4
     hstu_heads: int = 4
-    dropout: float = 0.2
+    dropout: float = 0.1
     attn_alpha: float = 1.0
 
     # --- [Research HSTU Advanced Parameters (Optional)] ---

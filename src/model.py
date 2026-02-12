@@ -608,58 +608,170 @@ class UniGCRModel(nn.Module):
         return ctr_logits, labels
 
     @torch.no_grad()
-    def generate_gr_candidates(self, batch_dict, k=10, grid_mapper=None):
+    def _constrained_beam_search(self, u_current, grid_mapper, beam_width=10):
         """
-        Generate top-k candidate items using beam search for evaluation
+        Trie-constrained beam search for 4-layer semantic code prediction.
+
+        At each layer, only codes that appear in at least one real catalog item
+        (given the current beam prefix) are considered.  Every completed beam is
+        therefore guaranteed to correspond to a valid item — no nearest-neighbour
+        fallback needed.
+
+        Contrast with _beam_search_hard_negatives (unconstrained): that method
+        generates arbitrary code tuples and falls back to Weighted-Hamming
+        nearest-neighbour lookup, which (a) wastes beam slots on non-existent
+        items and (b) causes multiple beams to collapse to the same nearest item.
 
         Args:
-            batch_dict: Input batch containing user history (sem_history, etc.)
-            k: Number of candidates to generate (beam width)
-            grid_mapper: GridMapper instance for converting semantic codes to item IDs
+            u_current:   (B, D) user representation from the HSTU backbone
+            grid_mapper: GridMapper instance — must have .trie built at init
+            beam_width:  k — number of candidates to return per user
 
         Returns:
-            candidates: (B, k) tensor of predicted item indices
+            candidates: (B, k) tensor of item IDs (integer indices into catalog)
         """
-        # 1. Forward pass to get user state
-        u, _, _ = self.forward(batch_dict)  # forward returns (u, logits_seq, None)
+        B      = u_current.size(0)
+        device = u_current.device
+        trie   = grid_mapper.trie           # {l0: {l1: {l2: {d: item_id}}}}
 
-        # 2. Use beam search to generate top-k semantic code candidates
-        # beam_results shape: (B, k, num_layers)
-        beam_results = self._beam_search_hard_negatives(
-            batch_dict,
-            u,
-            beam_width=k,
-            grid_mapper=grid_mapper
-        )
+        # ── Layer 0: restrict to L0 codes that exist in the trie ─────────────
+        logits_L0 = self.gr_head_L0(u_current)                    # (B, 256)
+        vocab_l0  = logits_L0.size(-1)
 
-        # 3. Convert semantic codes to item indices
-        B, beam_width, num_layers = beam_results.shape
+        mask_l0 = torch.full((vocab_l0,), float('-inf'), device=device)
+        mask_l0[list(trie.keys())] = 0.0                           # valid L0 codes → 0
 
-        # Flatten to (B*k, num_layers) for batch processing
-        codes_flat = beam_results.view(-1, num_layers)  # (B*k, 4) - RAW codes
+        log_probs_L0    = torch.log_softmax(logits_L0 + mask_l0, dim=-1)
+        beam_log_probs, beam_codes_L0 = torch.topk(log_probs_L0, beam_width, dim=-1)
+        # beam_log_probs: (B, k)   beam_codes_L0: (B, k) — all guaranteed in trie
 
-        # Convert semantic codes to item IDs using vectorized batch lookup
-        if grid_mapper:
-            # Apply offsets to entire batch at once
-            # RAW codes: [0-255, 0-255, 0-255, 0-18]
-            # Offset codes: [L0+1, L1+257, L2+513, Dedup+769]
-            offsets = torch.tensor([1, 257, 513, 769], device=codes_flat.device)
-            codes_offset = codes_flat + offsets  # (B*k, 4)
+        # ── Layer 1: restrict valid L1 codes per beam based on its L0 code ───
+        u_exp  = u_current.unsqueeze(1).expand(B, beam_width, -1) # (B, k, D)
+        emb_l0 = self.input_layer.sem_emb_layers[0](beam_codes_L0) # (B, k, D)
+        ctx_l1 = self.autoregressive_combiner_L1(
+            torch.cat([u_exp, emb_l0], dim=-1).view(B * beam_width, -1)
+        )                                                           # (B*k, D)
+        logits_L1 = self.gr_head_L1(ctx_l1)                        # (B*k, 256)
+        vocab_l1  = logits_L1.size(-1)
 
-            # DEBUG: Disabled for cleaner output
-            # Uncomment below to debug prediction codes
-            # if codes_offset.size(0) >= 10:
-            #     print(f"\n[DEBUG] Predictions: {codes_flat[:3].tolist()}")
+        # Build per-beam validity mask from trie: different L0 → different valid L1 set
+        l0_flat  = beam_codes_L0.view(-1).cpu().tolist()           # (B*k,)
+        mask_l1  = torch.full((B * beam_width, vocab_l1), float('-inf'), device=device)
+        for i, l0 in enumerate(l0_flat):
+            sub = trie.get(l0)
+            if sub:
+                mask_l1[i, list(sub.keys())] = 0.0
 
-            # Vectorized batch nearest neighbor lookup (FAST!)
-            # This replaces the slow loop with a single batched operation
-            # Uses Weighted Hamming Distance (hierarchical layer importance)
-            candidates = grid_mapper.codes_to_item_nearest_batch(codes_offset)  # (B*k,)
+        log_probs_L1 = torch.log_softmax(
+            logits_L1 + mask_l1, dim=-1
+        ).view(B, beam_width, vocab_l1)                            # (B, k, 256)
 
-            # Reshape to (B, k)
-            candidates = candidates.view(B, beam_width)
-        else:
-            # Fallback if no grid_mapper provided
-            candidates = torch.zeros(B, beam_width, dtype=torch.long, device=codes_flat.device)
+        expanded       = (beam_log_probs.unsqueeze(-1) + log_probs_L1).view(B, -1)
+        beam_log_probs, topk_idx = torch.topk(expanded, beam_width, dim=-1)
+        parent_l1  = topk_idx // vocab_l1                         # which L0 beam
+        codes_L1   = topk_idx %  vocab_l1                         # L1 code chosen
 
-        return candidates
+        batch_idx     = torch.arange(B, device=device).unsqueeze(1).expand(B, beam_width)
+        beam_codes_L0 = beam_codes_L0[batch_idx, parent_l1]       # (B, k) re-aligned
+        beam_codes    = torch.stack([beam_codes_L0, codes_L1], dim=-1)  # (B, k, 2)
+
+        # ── Layer 2: restrict valid L2 codes given (L0, L1) ──────────────────
+        emb_l0 = self.input_layer.sem_emb_layers[0](beam_codes[:, :, 0])  # (B, k, D)
+        emb_l1 = self.input_layer.sem_emb_layers[1](beam_codes[:, :, 1])  # (B, k, D)
+        ctx_l2 = self.autoregressive_combiner_L2(
+            torch.cat([u_exp, emb_l0, emb_l1], dim=-1).view(B * beam_width, -1)
+        )                                                           # (B*k, D)
+        logits_L2 = self.gr_head_L2(ctx_l2)                        # (B*k, 256)
+        vocab_l2  = logits_L2.size(-1)
+
+        pairs_flat = beam_codes.view(-1, 2).cpu().tolist()         # (B*k, 2)
+        mask_l2    = torch.full((B * beam_width, vocab_l2), float('-inf'), device=device)
+        for i, (l0, l1) in enumerate(pairs_flat):
+            sub = trie.get(l0, {}).get(l1)
+            if sub:
+                mask_l2[i, list(sub.keys())] = 0.0
+
+        log_probs_L2 = torch.log_softmax(
+            logits_L2 + mask_l2, dim=-1
+        ).view(B, beam_width, vocab_l2)                            # (B, k, 256)
+
+        expanded       = (beam_log_probs.unsqueeze(-1) + log_probs_L2).view(B, -1)
+        beam_log_probs, topk_idx = torch.topk(expanded, beam_width, dim=-1)
+        parent_l2  = topk_idx // vocab_l2
+        codes_L2   = topk_idx %  vocab_l2
+
+        beam_codes = beam_codes[batch_idx, parent_l2]              # (B, k, 2)
+        beam_codes = torch.cat([beam_codes, codes_L2.unsqueeze(-1)], dim=-1)  # (B, k, 3)
+
+        # ── Dedup layer: restrict valid D codes given (L0, L1, L2) ───────────
+        emb_l0 = self.input_layer.sem_emb_layers[0](beam_codes[:, :, 0])
+        emb_l1 = self.input_layer.sem_emb_layers[1](beam_codes[:, :, 1])
+        emb_l2 = self.input_layer.sem_emb_layers[2](beam_codes[:, :, 2])
+        ctx_d  = self.autoregressive_combiner_Dedup(
+            torch.cat([u_exp, emb_l0, emb_l1, emb_l2], dim=-1).view(B * beam_width, -1)
+        )                                                           # (B*k, D)
+        logits_D = self.gr_head_Dedup(ctx_d)                       # (B*k, 19)
+        vocab_d  = logits_D.size(-1)
+
+        triples_flat = beam_codes.view(-1, 3).cpu().tolist()       # (B*k, 3)
+        mask_d       = torch.full((B * beam_width, vocab_d), float('-inf'), device=device)
+        for i, (l0, l1, l2) in enumerate(triples_flat):
+            sub = trie.get(l0, {}).get(l1, {}).get(l2)
+            if sub:
+                # sub keys are item_ids at this point — we need only D codes
+                # sub is {d_code: item_id}, so sub.keys() = valid D codes
+                mask_d[i, list(sub.keys())] = 0.0
+
+        log_probs_D = torch.log_softmax(
+            logits_D + mask_d, dim=-1
+        ).view(B, beam_width, vocab_d)                             # (B, k, 19)
+
+        expanded       = (beam_log_probs.unsqueeze(-1) + log_probs_D).view(B, -1)
+        beam_log_probs, topk_idx = torch.topk(expanded, beam_width, dim=-1)
+        parent_d = topk_idx // vocab_d
+        codes_D  = topk_idx %  vocab_d
+
+        beam_codes = beam_codes[batch_idx, parent_d]               # (B, k, 3)
+        beam_codes = torch.cat([beam_codes, codes_D.unsqueeze(-1)], dim=-1)  # (B, k, 4)
+
+        # ── Exact item ID lookup from trie ────────────────────────────────────
+        # All beams are valid items (guaranteed by trie traversal above).
+        # Look up item_id directly — no nearest-neighbour needed.
+        codes_list = beam_codes.view(-1, 4).cpu().tolist()         # (B*k, 4)
+        item_ids   = []
+        for l0, l1, l2, d in codes_list:
+            item_id = trie.get(l0, {}).get(l1, {}).get(l2, {}).get(d, -1)
+            item_ids.append(item_id)
+
+        candidates = torch.tensor(item_ids, dtype=torch.long, device=device)
+        return candidates.view(B, beam_width)                      # (B, k)
+
+    @torch.no_grad()
+    def generate_gr_candidates(self, batch_dict, k=10, grid_mapper=None):
+        """
+        Generate top-k candidate items using beam search for evaluation.
+
+        Uses trie-constrained beam search when grid_mapper.trie is available
+        (the default after GridMapper.__init__).  Every candidate is then a
+        real catalog item and is looked up via exact trie traversal — no
+        nearest-neighbour fallback needed.
+
+        Falls back to the legacy unconstrained beam search + Weighted-Hamming
+        nearest-neighbour lookup when no grid_mapper is provided.
+
+        Args:
+            batch_dict:  Input batch containing user history
+            k:           Number of candidates to return (beam width)
+            grid_mapper: GridMapper instance (must have .trie attribute)
+
+        Returns:
+            candidates: (B, k) tensor of predicted item IDs
+        """
+        # 1. Forward pass to get user representation
+        u, _, _ = self.forward(batch_dict)
+
+        # 2. Constrained beam search — grid_mapper is always required
+        if grid_mapper is None:
+            raise ValueError("grid_mapper is required for generate_gr_candidates")
+
+        return self._constrained_beam_search(u, grid_mapper, beam_width=k)
