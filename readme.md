@@ -1,142 +1,50 @@
-# UniGCR — Unified Generative Collaborative Retrieval
+统一生成式检索 (Generative Retrieval, GR) 与点击率预测 (CTR) 的多任务学习框架。其核心思想是利用共享的序列表达能力，同时驱动两种不同性质的推荐任务。
 
-A sequential recommendation framework that uses **GRID semantic IDs** (RQ-VAE 4-layer hierarchical codes) and Meta's **Research HSTU** backbone for next-item prediction via autoregressive generative retrieval.
 
----
+```Text
+UniGCR_Repo/
+├── ds_config.json          # DeepSpeed 配置文件
+├── requirements.txt        # 依赖列表 (含安装顺序说明)
+├── run.py                  # 启动入口
+└── src/
+    ├── __init__.py
+    ├── config.py           # 全局配置 (Dataclass)
+    ├── data.py             # UniversalDataset & DataLoader
+    ├── grid_utils.py       # Semantic ID 映射与反查工具
+    ├── model.py            # 模型核心 (InputLayer, HSTU, Heads)
+    ├── trainer.py          # 训练循环, EarlyStop, Eval
+    └── utils.py            # Metrics, Distributed Utils
 
-## Architecture
 
-```
-User History (ASINs)
-      ↓  GridMapper
-Semantic Token Sequence  [L0, L1, L2, Dedup] × N items
-      ↓  UnifiedInputLayer (per-layer embeddings, summed)
-Item Embeddings  (B, N, D)
-      ↓  Research HSTU (causal self-attention)
-Contextualised Embeddings  (B, N, D)
-      ↓  Autoregressive GR Heads (L0 → L1 → L2 → Dedup)
-4-layer code prediction
-      ↓  Trie-constrained Beam Search (eval only)
-Top-k Item IDs
-```
+配置
+PyTorch 带CUDA
+# 示例：安装 PyTorch 2.1 + CUDA 12.1
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+安装Flash Attention 2
+pip install packaging ninja
+pip install flash-attn --no-build-isolation
 
-**Semantic IDs**: Each item is assigned a 4-tuple `[L0, L1, L2, D]` by running K-Means/RQ-VAE over item embeddings. L0–L2 have vocab size 256; the Dedup layer (vocab 19) resolves the rare case where two items share the same `[L0, L1, L2]` prefix.
+安装其他依赖包
+# 安装 DeepSpeed, Scikit-learn 等
+pip install deepspeed numpy pandas scikit-learn tqdm wget triton
 
-**Constrained Beam Search**: At evaluation, a prefix trie built from the catalog ensures every beam hypothesis is a real item. This eliminates the wasted beam slots and nearest-neighbour approximations of unconstrained search.
-
----
-
-## Repository Layout
-
-```
-UniGCR_New/
-├── run.py                      # Entry point (training + eval-only)
-├── requirements.txt
-├── data/
-│   ├── train_sequences.json    # Preprocessed user sequences (train)
-│   ├── test_sequences.json     # Preprocessed user sequences (test)
-│   ├── item2idx.json           # ASIN → integer ID mapping
-│   └── semantic_id_kmean.pt    # GRID codes tensor [4 × num_items]
-├── scripts/
-│   ├── prepare_amazon_data.py  # Build train/test splits from raw reviews
-│   └── inspect_semantic_ids.py # Visualise semantic ID statistics
-├── src/
-│   ├── config.py               # UniGCRConfig dataclass
-│   ├── data_amazon.py          # AmazonBeautyDataset + DataLoader
-│   ├── grid_utils.py           # GridMapper: loading, offsets, trie
-│   ├── hstu_builder.py         # Research HSTU factory
-│   ├── model.py                # UnifiedInputLayer + UniGCRModel
-│   ├── trainer.py              # Training loop, evaluation, checkpointing
-│   └── utils.py                # Metrics, distributed helpers, seed
-└── checkpoints/
-    └── best_model.pt           # Saved on best Hit@10
-```
-
----
-
-## Setup
-
-```bash
-# PyTorch with CUDA (example: CUDA 12.4)
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
-
-# fbgemm-gpu (required for Research HSTU custom ops)
-pip install fbgemm-gpu==1.1.0 --index-url https://download.pytorch.org/whl/cu124
-
-# Meta's generative-recommenders (Research HSTU)
+# 安装 Meta 的 generative-recommenders (HSTU)
 pip install git+https://github.com/facebookresearch/generative-recommenders.git@main
 
-# Other dependencies
-pip install scikit-learn tqdm numpy
-# Optional: DeepSpeed for multi-GPU
-pip install deepspeed
-```
 
----
+必要的准备工作 (Checklist)
+在运行之前，请确认以下文件存在：
+GRID Mapping File: data/beauty/semantic_ids.json。这是由 GRID 预处理生成的，格式应为 { "item_id": [code1, code2, code3], ... }。
+Config Adjustments: 在 run.py 中，请务必修改 conf.num_atomic_items 为你数据集真实的 Item 总数，否则 Embedding 层会报错或越界。
+# 指定可见设备
+# 即使是单卡，也建议用 torchrun 启动以保持环境一致
+torchrun --nproc_per_node=1 run.py \
+    --deepspeed \
+    --deepspeed_config ds_config.json \
+    --grid_mapping data/beauty/semantic_ids.json
 
-## Data Preparation
+评价指标完善：
+GR: 保持了 HitRate 和 NDCG。
+CTR: 新增了 AUC 和 LogLoss。通过 gather_tensors 确保了在多 GPU 环境下，AUC 是基于全局数据计算的，而不是局部 AUC 的平均值（那是不准确的）。
 
-```bash
-# Build train/test splits and item2idx from raw Amazon review JSON
-python scripts/prepare_amazon_data.py <path_to_Beauty_5.json>
-```
 
-The GRID semantic ID file (`data/semantic_id_kmean.pt`) must be generated separately using K-Means/RQ-VAE over item embeddings. Expected format: PyTorch tensor of shape `[4, num_items]` where each column is a `[L0, L1, L2, Dedup]` code tuple.
-
----
-
-## Training
-
-```bash
-python run.py \
-    --data_path data/train_sequences.json \
-    --grid_mapping data/semantic_id_kmean.pt
-```
-
-Key config options (edit `src/config.py` or set in `run.py`):
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `embed_dim` | 256 | Hidden dimension |
-| `hstu_layers` | 4 | Number of HSTU blocks |
-| `hstu_heads` | 4 | Attention heads |
-| `batch_size` | 256 | Training batch size |
-| `epochs` | 100 | Maximum epochs |
-| `lr` | 1e-3 | Initial learning rate (cosine decay → 1e-5) |
-
-**Teacher forcing schedule**: TF=1.0 for epochs 1–20, then linearly decays to 0.1 over epochs 21–80, held at 0.1 thereafter.
-
----
-
-## Evaluation
-
-```bash
-# Evaluate a saved checkpoint on the test split
-python run.py \
-    --eval_only \
-    --checkpoint checkpoints/best_model.pt \
-    --data_path data/train_sequences.json \
-    --grid_mapping data/semantic_id_kmean.pt
-```
-
-Metrics reported: **Hit@10**, **NDCG@10**, GR Loss.
-
----
-
-## Current Results (Amazon Beauty)
-
-| Config | Hit@10 | NDCG@10 |
-|--------|--------|---------|
-| 128d / 3L / 2H, unconstrained beam | 0.0228 | — |
-| 128d / 3L / 2H, constrained beam   | 0.0228 | — |
-| 256d / 4L / 4H, constrained beam   | 0.0300 | 0.0226 |
-
-TIGER (published baseline, Amazon Beauty): Hit@10 ≈ 0.077.
-
----
-
-## Known Limitations / Open Questions
-
-- **Exposure bias**: Model peaks early (epoch ~9) under the current TF schedule. Training loss continues to decrease while Hit@10 degrades — the all-position cross-entropy loss is a poor proxy for the final-position ranking metric.
-- **RQ-VAE code quality**: Semantic IDs are generated by K-Means rather than full RQ-VAE training; code collision rate and semantic cluster quality are unknown.
-- **CTR task**: Infrastructure exists but is not yet connected to real click labels (`enable_ctr=False`).
