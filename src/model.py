@@ -14,12 +14,11 @@ class UnifiedInputLayer(nn.Module):
         dim = config.embed_dim
 
         if config.use_semantic_seq:
-            # One embedding table per layer: L0, L1, L2 (vocab=256), Dedup (vocab=19)
+            # One embedding table per layer: L0, L1, L2 (vocab=256 each)
             self.sem_emb_layers = nn.ModuleList([
                 nn.Embedding(config.sem_id_codebook_size, dim, padding_idx=0),
                 nn.Embedding(config.sem_id_codebook_size, dim, padding_idx=0),
                 nn.Embedding(config.sem_id_codebook_size, dim, padding_idx=0),
-                nn.Embedding(config.sem_id_dedup_size, dim, padding_idx=0),
             ])
             self.num_semantic_layers = config.sem_id_layers
 
@@ -87,16 +86,14 @@ class UniGCRModel(nn.Module):
         self.input_layer = UnifiedInputLayer(config)
         self.backbone = build_research_hstu(config)
 
-        # GR heads: predict all 4 semantic tokens autoregressively
-        self.gr_head_L0    = nn.Linear(config.embed_dim, config.sem_id_codebook_size)
-        self.gr_head_L1    = nn.Linear(config.embed_dim, config.sem_id_codebook_size)
-        self.gr_head_L2    = nn.Linear(config.embed_dim, config.sem_id_codebook_size)
-        self.gr_head_Dedup = nn.Linear(config.embed_dim, config.sem_id_dedup_size)
+        # GR heads: predict all 3 semantic tokens autoregressively
+        self.gr_head_L0 = nn.Linear(config.embed_dim, config.sem_id_codebook_size)
+        self.gr_head_L1 = nn.Linear(config.embed_dim, config.sem_id_codebook_size)
+        self.gr_head_L2 = nn.Linear(config.embed_dim, config.sem_id_codebook_size)
 
         # Autoregressive combiners: project [u, prev_layer_embs] back to embed_dim
-        self.autoregressive_combiner_L1    = nn.Linear(config.embed_dim * 2, config.embed_dim)
-        self.autoregressive_combiner_L2    = nn.Linear(config.embed_dim * 3, config.embed_dim)
-        self.autoregressive_combiner_Dedup = nn.Linear(config.embed_dim * 4, config.embed_dim)
+        self.autoregressive_combiner_L1 = nn.Linear(config.embed_dim * 2, config.embed_dim)
+        self.autoregressive_combiner_L2 = nn.Linear(config.embed_dim * 3, config.embed_dim)
 
         # CTR components (optional)
         if config.enable_ctr:
@@ -145,10 +142,10 @@ class UniGCRModel(nn.Module):
             past_payloads={},
         )[:, :num_items, :]                                    # (B, num_items, D)
 
-        target_codes_seq = batch_dict.get('target_codes_seq')  # (B, num_items, 4) or None
+        target_codes_seq = batch_dict.get('target_codes_seq')  # (B, num_items, 3) or None
         tf_ratio = getattr(self, 'teacher_forcing_ratio', 1.0)
 
-        all_logits = [[], [], [], []]
+        all_logits = [[], [], []]
         for pos in range(num_items):
             logits_list, _ = self.predict_codes_autoregressive(
                 full_output[:, pos, :],
@@ -168,23 +165,23 @@ class UniGCRModel(nn.Module):
 
     def predict_codes_autoregressive(self, u, target_codes=None, training=True, teacher_forcing_ratio=1.0):
         """
-        Autoregressively predict 4-layer semantic codes for one sequence position.
+        Autoregressively predict 3-layer semantic codes for one sequence position.
 
-        A single per-sample scheduled-sampling mask (use_tf) is shared across all 4
+        A single per-sample scheduled-sampling mask (use_tf) is shared across all 3
         layers so that conditioning is consistent within each sample: a sample either
         uses ground-truth context for all layers or model-predicted context for all.
 
         Args:
             u:                    (B, D) user state from HSTU
-            target_codes:         (B, 4) raw GT codes without offsets, or None
+            target_codes:         (B, 3) raw GT codes without offsets, or None
             teacher_forcing_ratio: fraction of samples that use GT context
         Returns:
-            logits_list:   [(B, 256), (B, 256), (B, 256), (B, 19)]
-            sampled_codes: [(B,), (B,), (B,), (B,)]
+            logits_list:   [(B, 256), (B, 256), (B, 256)]
+            sampled_codes: [(B,), (B,), (B,)]
         """
         logits_list, sampled_codes = [], []
 
-        # One coin flip per sample, shared across all 4 layers (cascade consistency)
+        # One coin flip per sample, shared across all 3 layers (cascade consistency)
         if training and target_codes is not None:
             use_tf = torch.rand(u.size(0), device=u.device) < teacher_forcing_ratio
         else:
@@ -218,20 +215,12 @@ class UniGCRModel(nn.Module):
         code_L2 = pick(logits_L2, target_codes[:, 2] if target_codes is not None else None)
         sampled_codes.append(code_L2)
 
-        # Dedup conditioned on L0, L1, L2
-        emb_L2 = self.input_layer.sem_emb_layers[2](torch.clamp(code_L2, 0, 255))
-        ctx = self.autoregressive_combiner_Dedup(torch.cat([u, emb_L0, emb_L1, emb_L2], dim=1))
-        logits_D = self.gr_head_Dedup(ctx)
-        logits_list.append(logits_D)
-        code_D = pick(logits_D, target_codes[:, 3] if target_codes is not None else None)
-        sampled_codes.append(code_D)
-
         return logits_list, sampled_codes
 
     @torch.no_grad()
     def _constrained_beam_search(self, u_current, grid_mapper, beam_width=10):
         """
-        Trie-constrained beam search for 4-layer semantic code prediction.
+        Trie-constrained beam search for 3-layer semantic code prediction.
 
         At each layer, only codes that appear in at least one real catalog item
         (given the current beam prefix) are allowed. Every completed beam is
@@ -245,7 +234,7 @@ class UniGCRModel(nn.Module):
             candidates: (B, k) tensor of item IDs
         """
         B, device = u_current.size(0), u_current.device
-        trie = grid_mapper.trie  # {l0: {l1: {l2: {d: item_id}}}}
+        trie = grid_mapper.trie  # {l0: {l1: {l2: item_id}}}
 
         # L0
         logits_L0 = self.gr_head_L0(u_current)
@@ -290,34 +279,15 @@ class UniGCRModel(nn.Module):
                 mask_l2[i, list(sub.keys())] = 0.0
         log_p_L2 = torch.log_softmax(logits_L2 + mask_l2, dim=-1).view(B, beam_width, vocab_l2)
         expanded = (beam_log_probs.unsqueeze(-1) + log_p_L2).view(B, -1)
-        beam_log_probs, topk = torch.topk(expanded, beam_width, dim=-1)
+        _, topk  = torch.topk(expanded, beam_width, dim=-1)
         beam_codes = beam_codes[batch_idx, topk // vocab_l2]
         beam_codes = torch.cat([beam_codes, (topk % vocab_l2).unsqueeze(-1)], dim=-1)  # (B, k, 3)
 
-        # Dedup
-        emb_l0   = self.input_layer.sem_emb_layers[0](beam_codes[:, :, 0])
-        emb_l1   = self.input_layer.sem_emb_layers[1](beam_codes[:, :, 1])
-        emb_l2   = self.input_layer.sem_emb_layers[2](beam_codes[:, :, 2])
-        ctx_d    = self.autoregressive_combiner_Dedup(
-            torch.cat([u_exp, emb_l0, emb_l1, emb_l2], dim=-1).view(B * beam_width, -1))
-        logits_D = self.gr_head_Dedup(ctx_d)
-        vocab_d  = logits_D.size(-1)
-        mask_d   = torch.full((B * beam_width, vocab_d), float('-inf'), device=device)
-        for i, (l0, l1, l2) in enumerate(beam_codes.view(-1, 3).cpu().tolist()):
-            sub = trie.get(l0, {}).get(l1, {}).get(l2)
-            if sub:
-                # sub = {d_code: item_id}; sub.keys() = valid D codes for this prefix
-                mask_d[i, list(sub.keys())] = 0.0
-        log_p_D  = torch.log_softmax(logits_D + mask_d, dim=-1).view(B, beam_width, vocab_d)
-        expanded = (beam_log_probs.unsqueeze(-1) + log_p_D).view(B, -1)
-        _, topk  = torch.topk(expanded, beam_width, dim=-1)
-        beam_codes = beam_codes[batch_idx, topk // vocab_d]
-        beam_codes = torch.cat([beam_codes, (topk % vocab_d).unsqueeze(-1)], dim=-1)  # (B, k, 4)
-
         # Exact item ID lookup via trie (all beams guaranteed valid)
+        # 3-layer trie leaf is item_id directly: {l0: {l1: {l2: item_id}}}
         item_ids = [
-            trie.get(l0, {}).get(l1, {}).get(l2, {}).get(d, -1)
-            for l0, l1, l2, d in beam_codes.view(-1, 4).cpu().tolist()
+            trie.get(l0, {}).get(l1, {}).get(l2, -1)
+            for l0, l1, l2 in beam_codes.view(-1, 3).cpu().tolist()
         ]
         return torch.tensor(item_ids, dtype=torch.long, device=device).view(B, beam_width)
 
