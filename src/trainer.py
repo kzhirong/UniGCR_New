@@ -89,9 +89,9 @@ class UniGCRTrainer:
         return self.config.loss_alpha * loss_info + self.config.loss_beta * loss_bce
 
     def _layer_offsets(self):
-        """Return per-layer token offsets consistent with GridMapper."""
+        """Return [L0, L1, L2, Dedup] token offsets consistent with GridMapper."""
         c = self.config.sem_id_codebook_size
-        return [1 + i * c for i in range(self.config.sem_id_layers)]
+        return [1, 1 + c, 1 + 2 * c, 1 + 3 * c]
 
     def train_epoch(self, epoch_idx):
         self.model.train()

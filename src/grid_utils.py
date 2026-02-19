@@ -1,7 +1,5 @@
 import json
 import os
-import pickle
-import numpy as np
 import torch
 
 
@@ -9,7 +7,7 @@ class GridMapper:
     """
     Handles semantic ID mapping for GRID-encoded items.
 
-    Loads a pre-computed mapping (item_id -> [L0, L1, L2] raw codes),
+    Loads a pre-computed mapping (item_id -> [L0, L1, L2, Dedup] raw codes),
     builds offset-adjusted token ranges for each layer, and constructs a
     prefix trie used by constrained beam search at evaluation time.
     """
@@ -87,23 +85,6 @@ class GridMapper:
             print(f"[Warning] GRID mapping not found at {path}")
             return {}
 
-        if path.endswith('.pkl'):
-            with open(path, 'rb') as f:
-                data = pickle.load(f)
-            if not isinstance(data, list):
-                raise ValueError(f"Expected list in {path}, got {type(data)}")
-            mapping = {}
-            for item in data:
-                item_id, semantic_ids = item
-                if isinstance(semantic_ids, np.ndarray):
-                    semantic_ids = semantic_ids.tolist()
-                elif isinstance(semantic_ids, torch.Tensor):
-                    semantic_ids = semantic_ids.tolist()
-                mapping[int(item_id)] = [int(c) for c in semantic_ids]
-            print(f"[GridMapper] Loaded {len(mapping)} items from PKL "
-                  f"({len(next(iter(mapping.values())))} layers).")
-            return mapping
-
         if path.endswith('.pt'):
             tensor = torch.load(path)
             if not isinstance(tensor, torch.Tensor):
@@ -111,10 +92,10 @@ class GridMapper:
             num_layers, num_items = tensor.shape
             print(f"[GridMapper] Loaded: {num_layers} layers × {num_items} items")
             return {item_id: tensor[:, item_id].tolist() for item_id in range(num_items)}
-
-        with open(path, 'r') as f:
-            raw = json.load(f)
-        return {int(k): v for k, v in raw.items()}
+        else:
+            with open(path, 'r') as f:
+                raw = json.load(f)
+            return {int(k): v for k, v in raw.items()}
 
     def _apply_offset(self, codes):
         return [self.layer_ranges[i][0] + c for i, c in enumerate(codes)]

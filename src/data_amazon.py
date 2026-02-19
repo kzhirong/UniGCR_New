@@ -34,10 +34,10 @@ class AmazonBeautyDataset(Dataset):
         print(f"[Dataset] {len(self.data)} {mode} samples")
 
     def _load_item2idx(self, data_path):
-        # asin_to_idx.json is 0-indexed (matches part-00000.pkl item IDs exactly)
-        item2idx_path = os.path.join(os.path.dirname(data_path), 'asin_to_idx.json')
+        item2idx_path = os.path.join(os.path.dirname(data_path), 'item2idx.json')
         if not os.path.exists(item2idx_path):
-            print(f"[Warning] asin_to_idx.json not found at {item2idx_path}")
+            print(f"[Warning] item2idx.json not found at {item2idx_path}")
+            print("Run: python scripts/prepare_amazon_data.py <review_file>")
             return {}
         with open(item2idx_path, 'r') as f:
             return json.load(f)
@@ -99,7 +99,7 @@ class AmazonBeautyDataset(Dataset):
             )
             target_raw = torch.tensor(target_tokens, dtype=torch.long).view(-1, n_l)
             target_raw = torch.clamp(target_raw - layer_starts.unsqueeze(0), min=0)
-            output['target_codes_seq'] = target_raw  # (num_items, 3)
+            output['target_codes_seq'] = target_raw  # (num_items, 4)
 
             output['lengths'] = torch.tensor(actual_length, dtype=torch.long)
             output['ctr_pos_codes'] = torch.tensor(tgt_codes, dtype=torch.long)

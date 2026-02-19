@@ -17,10 +17,11 @@ class UniGCRConfig:
     ctr_use_cross_attn: bool = True
 
     # Semantic ID / GRID
-    # 3 layers: L0, L1, L2 (K-Means, vocab=256 each) from part-00000.pkl
-    sem_id_layers: int = 3
+    # 4 layers: L0, L1, L2 (K-Quantization, vocab=256 each) + Dedup (collision resolution, vocab=19)
+    sem_id_layers: int = 4
     sem_id_codebook_size: int = 256
-    grid_mapping_path: str = "../data/part-00000.pkl"
+    sem_id_dedup_size: int = 19
+    grid_mapping_path: str = "data/semantic_id_kmean.pt"
 
     # Atomic ID (optional auxiliary input)
     num_atomic_items: int = 0
@@ -33,8 +34,8 @@ class UniGCRConfig:
     # Model architecture
     embed_dim: int = 256
     # max_seq_len must satisfy: (max_seq_len - 1) % sem_id_layers == 0
-    # 151 - 1 = 150 = 50 items × 3 tokens
-    max_seq_len: int = 151
+    # 153 - 1 = 152 = 38 items × 4 tokens
+    max_seq_len: int = 153
     hstu_layers: int = 4
     hstu_heads: int = 4
     dropout: float = 0.1
